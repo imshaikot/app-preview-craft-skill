@@ -109,3 +109,24 @@ body { -webkit-font-smoothing: antialiased; text-rendering: geometricPrecision; 
 .wall { position: absolute; transform-style: preserve-3d; }
 .wall-card { position: absolute; border-radius: 3vmin; backdrop-filter: blur(3vmin); }
 .scrim { position: absolute; inset: 0; pointer-events: none; }
+
+/* studio editor overlay (stage/lib/editor.js; never present in a render) */
+#edit { position: absolute; inset: 0; z-index: 10; pointer-events: none; --ed: 1; font: 500 calc(11px * var(--ed))/1.2 ui-sans-serif, system-ui, sans-serif; }
+#edit .ed-box { position: absolute; box-sizing: border-box; border: calc(1.5px * var(--ed)) dashed rgba(124,156,255,.75); border-radius: calc(6px * var(--ed)); }
+#edit .ed-box.selected { border-style: solid; border-color: #7c9cff; }
+#edit .ed-box i { position: absolute; width: calc(11px * var(--ed)); height: calc(11px * var(--ed)); margin: calc(-6px * var(--ed)); border-radius: 50%; background: #fff; border: calc(2px * var(--ed)) solid #7c9cff; box-sizing: border-box; pointer-events: auto; display: none; }
+#edit .ed-box.selected:not(.no-size) i { display: block; }
+#edit .ed-box i[data-h=nw] { left: 0; top: 0; cursor: nwse-resize; }
+#edit .ed-box i[data-h=se] { left: 100%; top: 100%; cursor: nwse-resize; }
+#edit .ed-box i[data-h=ne] { left: 100%; top: 0; cursor: nesw-resize; }
+#edit .ed-box i[data-h=sw] { left: 0; top: 100%; cursor: nesw-resize; }
+#edit .ed-label { position: absolute; left: 0; bottom: 100%; margin-bottom: calc(6px * var(--ed)); padding: calc(3px * var(--ed)) calc(7px * var(--ed)); border-radius: calc(5px * var(--ed)); background: #7c9cff; color: #0b0d14; white-space: nowrap; }
+#edit .ed-label.below { bottom: auto; top: 100%; margin: calc(6px * var(--ed)) 0 0; }
+#edit .ed-box:not(.selected) .ed-label { background: rgba(20,22,30,.8); color: #dfe5ff; }
+#edit .ed-guide { position: absolute; background: #ff5fa2; }
+#edit .ed-gx { left: 50%; top: 0; bottom: 0; width: calc(1px * var(--ed)); }
+#edit .ed-gy { top: 50%; left: 0; right: 0; height: calc(1px * var(--ed)); }
+#edit .ed-light { position: absolute; width: calc(26px * var(--ed)); height: calc(26px * var(--ed)); margin: calc(-13px * var(--ed)); border-radius: 50%; background: radial-gradient(circle, #fff 0 28%, #ffd54a 30% 46%, transparent 48%); box-shadow: 0 0 calc(18px * var(--ed)) rgba(255,213,74,.8); }
+#edit[data-tool=pick] ~ *, #edit[data-tool=pick] { cursor: crosshair; }
+.ed-decor { pointer-events: auto !important; cursor: move; }
+.ed-decor:hover { outline: 2px dashed rgba(124,156,255,.8); outline-offset: 4px; }
