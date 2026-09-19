@@ -3,13 +3,15 @@
 //   await stage.load(spec)   build everything; resolves when fonts, images and
 //                            models are ready
 //   await stage.seek(t)      pose every layer for time t and paint a frame
+//   await stage.patch(theme) retune a loaded stage in place when only live
+//                            properties changed (the studio's sliders and drags)
 //
 // spec = {category, theme (resolved object), width, height, slides, index,
 //         count, brand, pixelRatio, editable, animated, credits}
 import { FONTS } from './catalog/fonts.js'
-import { DEVICES } from './catalog/devices.js'
-import { LAYOUTS } from './catalog/layouts.js'
-import { merge } from './catalog/resolve.js'
+import { deviceDef, registerDevices } from './catalog/devices.js'
+import { LAYOUTS, STATIC_PLACE } from './catalog/layouts.js'
+import { isObj, merge } from './catalog/resolve.js'
 import { buildBackground } from './lib/backgrounds.js'
 import { buildDecor } from './lib/decor.js'
 import { FlatDevice } from './lib/flat.js'
@@ -50,6 +52,31 @@ async function loadFonts(ids, base) {
   await document.fonts.ready
 }
 
+/** path -> JSON of every leaf (arrays count as leaves), to diff two themes. */
+function leaves(obj, prefix = '', out = new Map()) {
+  for (const [k, v] of Object.entries(obj ?? {})) {
+    const p = prefix ? `${prefix}.${k}` : k
+    if (isObj(v)) leaves(v, p, out)
+    else out.set(p, JSON.stringify(v))
+  }
+  return out
+}
+
+/** Copy `from` into `into` without replacing objects layouts hold references to. */
+function assignDeep(into, from) {
+  for (const k of Object.keys(into)) if (!(k in from)) delete into[k]
+  for (const [k, v] of Object.entries(from)) {
+    if (isObj(v) && isObj(into[k])) assignDeep(into[k], v)
+    else into[k] = isObj(v) ? merge(v) : v
+  }
+}
+
+// Properties a loaded stage can take without a rebuild. Everything else
+// (type, palette, background, layout, device model…) builds DOM or geometry.
+const LIVE_SCENE = /^scene\.(exposure|env|envRotation|ambient|key\.|shadow\.blur|rims|points|camera\.)/
+const LIVE_PLACE = /^device\.(pose|x|y|z|size|float|spread|fanAngle|secondary\.|phone\.)/
+const LIVE_LOOK = /^device\.(finish|glare)$/
+
 class Stage {
   constructor() {
     this.root = $('stage')
@@ -60,6 +87,8 @@ class Stage {
 
   reset() {
     this.stop?.()
+    this.editor?.dispose()
+    this.editor = null
     this.ready = false
     for (const l of Object.values(this.layers)) {
       l.innerHTML = ''
@@ -80,6 +109,7 @@ class Stage {
   async load(spec) {
     this.reset()
     this.spec = spec
+    this.flatDevices = []
     const W = spec.width
     const H = spec.height
     const index = spec.index ?? 0
@@ -89,6 +119,7 @@ class Stage {
     const theme = spec.animated && spec.kind === 'video' ? spec.theme : merge(spec.theme, slide.theme)
     this.theme = theme
     const warnings = []
+    registerDevices(spec.devices)
 
     Object.assign(this.root.style, { width: `${W}px`, height: `${H}px` })
     document.documentElement.style.setProperty('--W', `${W}px`)
@@ -195,16 +226,67 @@ class Stage {
     await this.seek(spec.time ?? 0)
     const used = [...new Set((this.three?.devices ?? []).map((d) => d.id))]
     this.info = { duration }
+    if (spec.editable) {
+      const { Editor } = await import('./lib/editor.js')
+      this.editor = new Editor(this)
+    }
     return {
       kind,
       duration,
       fps,
       frames: kind === 'video' ? Math.ceil(duration * fps) : 1,
       devices: used,
-      credits: used.map((id) => DEVICES[id].credit),
+      credits: used.map((id) => deviceDef(id).credit).filter(Boolean),
+      // A model someone brought without saying whose it is: the caller says so in CREDITS.txt.
+      uncredited: used.filter((id) => !deviceDef(id).credit).map((id) => deviceDef(id).name),
       warnings,
       gl: this.three ? this.glInfo() : null,
     }
+  }
+
+  /** Which changed paths a loaded stage cannot take in place. Empty = patchable. */
+  rebuilds(next) {
+    const a = leaves(this.theme)
+    const b = leaves(next)
+    const changed = [...new Set([...a.keys(), ...b.keys()])].filter((k) => a.get(k) !== b.get(k))
+    const t = this.theme
+    return changed.filter((path) => {
+      if (path === 'motion.keys') return t.layout !== 'keyframes'
+      if (!this.three) return true
+      if (LIVE_SCENE.test(path)) return false
+      if (LIVE_LOOK.test(path)) return t.device.mode !== '3d'
+      if (LIVE_PLACE.test(path)) {
+        // The mirror floor is centered under the device when the scene is built.
+        if (path === 'device.x' && t.scene.floor?.mirror) return true
+        return STATIC_PLACE.has(t.layout) || t.device.mode !== '3d'
+      }
+      return true
+    })
+  }
+
+  /**
+   * Take a new resolved theme without rebuilding, when every change is live.
+   * Returns {exact: false, rebuilds} untouched otherwise, and the caller loads.
+   * A patched stage draws the same pixels a fresh load of that theme would —
+   * the selftest holds it to that.
+   */
+  async patch(nextTheme) {
+    if (!this.ready) return { exact: false, rebuilds: ['not loaded'] }
+    const slide = this.ctx.slides[this.ctx.index] ?? {}
+    const next = this.spec.animated && this.spec.kind === 'video' ? nextTheme : merge(nextTheme, slide.theme)
+    const rebuilds = this.rebuilds(next)
+    if (rebuilds.length) return { exact: false, rebuilds }
+    assignDeep(this.theme, next)
+    this.spec.theme = nextTheme
+    this.three.setLook(this.theme.scene)
+    this.three.setView({ ...this.theme.scene.camera })
+    for (const d of this.three.devices) {
+      d.setFinish(d.finishOverride ?? this.theme.device.finish)
+      d.setGlare(this.theme.device.glare)
+    }
+    await this.seek(this.time ?? 0, { fast: true })
+    this.editor?.sync()
+    return { exact: true }
   }
 
   glInfo() {
@@ -228,9 +310,11 @@ class Stage {
         modelBase: `${ctx.spec.assetBase ?? '/'}assets/models/`,
         screenScale: ctx.spec.screenScale ?? 1,
       })
-      dev.isLaptop = DEVICES[model].kind === 'laptop'
-      dev.aspect = DEVICES[model].display[0] / DEVICES[model].display[1]
+      dev.finishOverride = opts.finish
+      dev.isLaptop = dev.kind === 'laptop'
+      dev.aspect = dev.display[0] / dev.display[1]
       dev.standHeight = (size) => size * dev.dims.y
+      if (!dev.screens.length) ctx.warnings.push(`${deviceDef(model).name}: no screen is set for this model, so it shows no screenshot`)
       return dev
     }
     // Flat and frameless: aspect follows the frame, or the screenshot itself.
@@ -247,6 +331,7 @@ class Stage {
     })
     dev.isLaptop = variant === 'browser'
     dev.standHeight = (size) => size
+    this.flatDevices.push(dev)
     return dev
   }
 
@@ -258,6 +343,7 @@ class Stage {
     this.bgUpdate?.(t)
     for (const d of this.decor) d.update(t)
     this.three?.render()
+    this.editor?.sync()
     if (fast) return
     await nextFrame()
     await nextFrame()
@@ -330,13 +416,14 @@ window.addEventListener('message', async (e) => {
   try {
     if (msg.type === 'stage:load') {
       runLoad(msg, e.source)
-    } else if (msg.type === 'stage:nudge') {
-      // Live drag-to-rotate; the studio commits the pose when the drag ends.
-      for (const d of stage.three?.devices ?? []) {
-        d.pivot.rotation.y += msg.dx
-        d.pivot.rotation.x += msg.dy
-      }
-      stage.three?.render()
+    } else if (msg.type === 'stage:patch') {
+      // Not while a load is in flight: that load carries a newer theme anyway.
+      const r = loading ? { exact: false, rebuilds: ['loading'] } : await stage.patch(msg.theme)
+      e.source?.postMessage({ type: 'stage:patched', id: msg.id, ...r }, '*')
+    } else if (msg.type === 'stage:tool') {
+      // Kept on the stage: the editor is rebuilt by every load, the tool in hand is not.
+      stage.toolState = { ...stage.toolState, tool: msg.tool, scope: msg.scope }
+      stage.editor?.setTool(msg)
     } else if (msg.type === 'stage:seek') {
       stage.stop?.()
       await stage.seek(msg.time, { fast: !!msg.fast })

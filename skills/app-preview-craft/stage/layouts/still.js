@@ -1,6 +1,11 @@
 // Still layouts. Each is async (ctx) => update(t); stills call update(0)
 // once, but the functions stay time-aware so a still layout also animates
 // gently when used in the studio's live preview.
+//
+// Devices are placed inside update, from ctx.theme as it is then: the studio
+// retunes a loaded stage by changing the theme and seeking again (stage.patch).
+// `dev.edit` tells the studio's editor which theme block a device is posed by,
+// and which of move / turn / size that layout actually reads.
 import { addText, headlineSize, screenState, standInFront, textBox } from './common.js'
 import { wobble } from '../lib/ease.js'
 import { drawCover } from '../lib/screen.js'
@@ -43,13 +48,10 @@ export const STILL = {
     headline(ctx)
     const d = ctx.theme.device
     const dev = await ctx.device()
-    if (dev) {
-      placeFrom(ctx, dev, d)
-      await paintSlide(ctx, dev)
-    }
-    return (t) => {
-      if (dev && ctx.animated && d.float) placeFrom(ctx, dev, d, { y: d.y * ctx.H + wobble(t, 1) * ctx.u * 1.5 * d.float })
-    }
+    const place = (t = 0) => dev && placeFrom(ctx, dev, d, ctx.animated && d.float ? { y: d.y * ctx.H + wobble(t, 1) * ctx.u * 1.5 * d.float } : {})
+    place()
+    await paintSlide(ctx, dev)
+    return place
   },
 
   async 'hero-bottom'(ctx) {
@@ -70,37 +72,48 @@ export const STILL = {
     const back = await ctx.device()
     const front = await ctx.device()
     if (!front) return () => {}
-    placeFrom(ctx, back, { ...d, ...d.secondary })
-    placeFrom(ctx, front, d)
+    back.edit = { path: 'device.secondary' }
+    const place = () => {
+      placeFrom(ctx, back, { ...d, ...d.secondary })
+      placeFrom(ctx, front, d)
+    }
+    place()
     await paintSlide(ctx, back, ctx.index + 1)
     await paintSlide(ctx, front)
-    return () => {}
+    return place
   },
 
   async fan(ctx) {
     headline(ctx)
     const { W, H } = ctx
     const d = ctx.theme.device
-    const spread = d.spread ?? 0.3
-    const ang = d.fanAngle ?? 12
     const devs = []
     for (const k of [-1, 1, 0]) {
       const dev = await ctx.device()
       if (!dev) return () => {}
-      const side = k !== 0
-      dev.place({
-        x: (d.x + k * spread * (H > W ? 1 : 0.55)) * W,
-        y: d.y * H + (side ? H * 0.03 : 0),
-        z: side ? -0.08 * H : 0,
-        size: d.size * H * (side ? 0.86 : 1),
-        rx: 0,
-        ry: -k * ang * 1.4,
-        rz: -k * ang,
-      })
+      // The fan sets every angle itself; the block moves and scales as one.
+      dev.edit = { path: 'device', turn: false }
       await paintSlide(ctx, dev, ctx.index + k)
-      devs.push(dev)
+      devs.push([k, dev])
     }
-    return () => {}
+    const place = () => {
+      const spread = d.spread ?? 0.3
+      const ang = d.fanAngle ?? 12
+      for (const [k, dev] of devs) {
+        const side = k !== 0
+        dev.place({
+          x: (d.x + k * spread * (H > W ? 1 : 0.55)) * W,
+          y: d.y * H + (side ? H * 0.03 : 0),
+          z: side ? -0.08 * H : 0,
+          size: d.size * H * (side ? 0.86 : 1),
+          rx: 0,
+          ry: -k * ang * 1.4,
+          rz: -k * ang,
+        })
+      }
+    }
+    place()
+    return place
   },
 
   async split(ctx) {
@@ -111,16 +124,21 @@ export const STILL = {
       base: headlineSize(ctx) * (portrait ? 1 : 1.05),
     })
     const dev = await ctx.device()
-    if (dev) {
+    if (!dev) return () => {}
+    const place = () => {
       const d = { ...th.device }
-      if (pos === 'right' && d.x > 0.5) d.x = 1 - d.x
+      const flip = pos === 'right' && d.x > 0.5
+      if (flip) d.x = 1 - d.x
       if (portrait) Object.assign(d, { x: 0.5, y: 0.64, size: 0.7 })
       // Sizes are tuned for ~1.9:1 cards; shrink toward square.
       else d.size *= Math.min(1, Math.max(0.72, ctx.W / ctx.H / 1.9))
+      // A portrait page pins the device under the headline.
+      dev.edit = { path: 'device', moveX: !portrait, moveY: !portrait, size: !portrait, flipX: flip }
       placeFrom(ctx, dev, d)
-      await paintSlide(ctx, dev)
     }
-    return () => {}
+    place()
+    await paintSlide(ctx, dev)
+    return place
   },
 
   async 'big-type'(ctx) {
@@ -151,11 +169,10 @@ export const STILL = {
     })
     addText(ctx, { title: s.title, subtitle: s.subtitle }, textBox(ctx, theme.text.position === 'top' ? 'top' : 'bottom'))
     const dev = await ctx.device()
-    if (dev) {
-      placeFrom(ctx, dev, theme.device)
-      await paintSlide(ctx, dev)
-    }
-    return () => {}
+    const place = () => dev && placeFrom(ctx, dev, theme.device)
+    place()
+    await paintSlide(ctx, dev)
+    return place
   },
 
   async bento(ctx) {
@@ -225,20 +242,25 @@ export const STILL = {
     const d = ctx.theme.device
     const laptop = await ctx.device({ mode: '3d', model: d.laptop ?? 'macbook-pro-16' })
     const phone = await ctx.device({ mode: d.mode === 'flat' ? 'flat' : '3d' })
-    placeFrom(ctx, laptop, d)
-    const ph = { ...d, ...d.phone }
-    standInFront(ctx, laptop, phone, { x: ph.x * ctx.W, y: ph.y * ctx.H, z: (ph.z ?? 0) * ctx.H, size: ph.size * ctx.H, ...poseOf(ph) })
+    phone.edit = { path: 'device.phone' }
+    const place = () => {
+      placeFrom(ctx, laptop, d)
+      const ph = { ...d, ...d.phone }
+      standInFront(ctx, laptop, phone, { x: ph.x * ctx.W, y: ph.y * ctx.H, z: (ph.z ?? 0) * ctx.H, size: ph.size * ctx.H, ...poseOf(ph) })
+    }
+    place()
     laptop.paint(await screenState(ctx, ctx.desktopIndex ?? ctx.index, 0, 1, { desktop: true }))
     await paintSlide(ctx, phone)
-    return () => {}
+    return place
   },
 
   async showcase(ctx) {
     headline(ctx)
     const dev = await ctx.device({ mode: '3d' })
-    placeFrom(ctx, dev, ctx.theme.device)
+    const place = () => placeFrom(ctx, dev, ctx.theme.device)
+    place()
     await paintSlide(ctx, dev)
-    return () => {}
+    return place
   },
 
   async pedestal(ctx) {
@@ -253,9 +275,10 @@ export const STILL = {
       finish: pl.finish ?? 'matte',
     })
     const dev = await ctx.device({ mode: '3d' })
-    placeFrom(ctx, dev, theme.device)
+    const place = () => placeFrom(ctx, dev, theme.device)
+    place()
     await paintSlide(ctx, dev)
-    return () => {}
+    return place
   },
 
   async lineup(ctx) {
@@ -265,17 +288,26 @@ export const STILL = {
     const ids = theme.devices ?? ['iphone-17-pro']
     const n = ids.length
     const span = Math.min(0.84, 0.2 * n)
+    const devs = []
     for (const [k, id] of ids.entries()) {
       const dev = await ctx.device({ mode: '3d', model: id })
-      const x = n === 1 ? 0.5 : 0.5 - span / 2 + (span * k) / (n - 1)
-      const size = d.size * (dev.isLaptop ? 1.5 : 1)
-      const bottom = theme.scene.floor ? theme.scene.floor.y : d.y + size / 2
-      // Stand every device on the floor line.
-      const h = size * H
-      dev.place({ x: x * W, y: (bottom - 0.003) * H - dev.standHeight(h) / 2, size: h, ...poseOf(d), z: (Math.abs(k - (n - 1) / 2) * -0.04) * H })
+      // The row spaces itself and stands on the floor line.
+      dev.edit = { path: 'device', moveX: false, moveY: !theme.scene.floor }
       await paintSlide(ctx, dev, ctx.index + k)
+      devs.push(dev)
     }
-    return () => {}
+    const place = () => {
+      for (const [k, dev] of devs.entries()) {
+        const x = n === 1 ? 0.5 : 0.5 - span / 2 + (span * k) / (n - 1)
+        const size = d.size * (dev.isLaptop ? 1.5 : 1)
+        const bottom = theme.scene.floor ? theme.scene.floor.y : d.y + size / 2
+        // Stand every device on the floor line.
+        const h = size * H
+        dev.place({ x: x * W, y: (bottom - 0.003) * H - dev.standHeight(h) / 2, size: h, ...poseOf(d), z: (Math.abs(k - (n - 1) / 2) * -0.04) * H })
+      }
+    }
+    place()
+    return place
   },
 
   async flatlay(ctx) {
@@ -285,11 +317,18 @@ export const STILL = {
       { x: 0.33, y: 0.52, rz: -14, size: 0.78 },
       { x: 0.66, y: 0.48, rz: 9, size: 0.78, model: 'iphone-17-pro-max' },
     ]
+    const devs = []
     for (const [k, it] of items.entries()) {
       const dev = await ctx.device({ mode: '3d', model: it.model })
-      placeFrom(ctx, dev, { x: it.x, y: it.y, size: (it.size ?? theme.device.size), pose: [0, it.back ? 180 : 0, it.rz ?? 0] })
+      // Each item is laid out by `flatlay`, a list; only the shared size is a device knob.
+      dev.edit = { path: 'device', moveX: false, moveY: false, turn: false, size: it.size == null }
       await paintSlide(ctx, dev, ctx.index + k)
+      devs.push([it, dev])
     }
-    return () => {}
+    const place = () => {
+      for (const [it, dev] of devs) placeFrom(ctx, dev, { x: it.x, y: it.y, size: (it.size ?? theme.device.size), pose: [0, it.back ? 180 : 0, it.rz ?? 0] })
+    }
+    place()
+    return place
   },
 }
