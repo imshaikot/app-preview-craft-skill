@@ -1,6 +1,6 @@
 ---
 name: app-preview-craft
-description: "Creates marketing visuals for an app from its screenshots and screen recordings: App Store and Google Play screenshot sets, social and Open Graph cards, 2D screen videos, 3D device mockup images and 3D device videos (iPhone, Galaxy, MacBook). Renders locally with headless Chrome, three.js, sharp and ffmpeg; 40 themes, every property configurable, plus a live preview studio. Use when the user wants app store or play store screenshots, an app preview or promo video, a phone or device mockup, a 3D phone animation, or a launch/social card for their app. Not for diagrams, slides, or capturing screenshots of a running app."
+description: "Creates marketing visuals for an app from its screenshots and screen recordings: App Store and Google Play screenshot sets, social and Open Graph cards, 2D screen videos, 3D device mockup images and 3D device videos (iPhone, Galaxy, MacBook). Renders locally with headless Chrome, three.js, sharp and ffmpeg; 41 themes, every property configurable, your own .glb device models, plus a studio where the preview is the editor. Use when the user wants app store or play store screenshots, an app preview or promo video, a phone or device mockup, a 3D phone animation, or a launch/social card for their app. Not for diagrams, slides, or capturing screenshots of a running app."
 license: MIT
 compatibility: "Needs a shell, Node 20+, npm, and a Chromium-based browser (Chrome, Chromium, Edge, Brave) with WebGL; set CHROME_PATH if it is somewhere unusual. Videos and screen-recording input need ffmpeg (set FFMPEG_PATH if not on PATH). First use runs `npm install` inside the skill (~95 MB: three.js, sharp, puppeteer-core, fonts). Works offline after that. Not usable where there is no shell or browser (claude.ai chat, the Skills API, most CI images without Chrome)."
 metadata:
@@ -22,8 +22,9 @@ prefix commands with it — `$SKILL` means that directory throughout:
 ```bash
 SKILL=/absolute/path/to/app-preview-craft        # the folder with SKILL.md, scripts/, stage/
 # not sure where it was installed? (skill folders, then the Claude Code plugin cache)
-find ./.claude/skills ./.agents/skills ~/.claude/skills ~/.agents/skills ~/.gemini/skills \
-     ~/.claude/plugins -path '*app-preview-craft*/scripts/cli.mjs' 2>/dev/null | head -1
+find ./.claude/skills ./.agents/skills ./.goose/skills ~/.claude/skills ~/.agents/skills \
+     ~/.gemini/skills ~/.config/goose/skills ~/.claude/plugins \
+     -path '*app-preview-craft*/scripts/cli.mjs' 2>/dev/null | head -1
 ```
 
 Then check the machine. `--fix` runs `npm install` inside the skill when packages are missing:
@@ -133,7 +134,8 @@ serif, duotone screen), `duo` (MacBook + phone — pass a `desktop` screen for t
 ### device-video (3D)
 `turntable`, `orbit` (camera arcs), `float` (loopable), `rise` (camera pushes in), `flip`
 (back → front reveal), `trio` (three models fan out), `desk` (MacBook lid opens, phone slides
-in beside it; both stand on `scene.floor`), `spotlight` (360° on a mirror), `synthwave`.
+in beside it; both stand on `scene.floor`), `spotlight` (360° on a mirror), `synthwave`,
+`keyframes` (your own device and camera move, from `motion.keys` — see §5).
 
 ### device-mockup (3D stills)
 `studio`, `noir`, `pedestal`, `levitate`, `lineup` (every phone model), `flatlay`,
@@ -165,12 +167,21 @@ project config `themeOverrides` → CLI shortcuts → `--set` → per-slide `the
   screen still reads at store-thumbnail size; steeper poses work but cost legibility.
 - Colors accept `auto` = the most vivid color in the first screenshot: `--accent auto`.
 - `--device iphone-17-pro | iphone-17-pro-max | iphone-12-pro | galaxy-s21-ultra |
-  macbook-pro-16 | flat[:phone|phone-android|tablet|browser] | frameless | none`.
+  macbook-pro-16 | flat[:phone|phone-android|tablet|browser] | frameless | none`, or the id
+  of the user's own model (§7).
 - Layouts are interchangeable within a kind (`list layouts`): stills — `hero-top`,
   `hero-bottom`, `tilt`, `duo`, `fan`, `split`, `big-type`, `callout`, `bento`,
   `laptop-phone`, `showcase`, `pedestal`, `lineup`, `flatlay`; videos — `carousel`, `stack`,
   `scroll`, `zoom-tour`, `wall`, `phone-swap`, `grid-reveal`, `turntable`, `orbit`, `float`,
-  `rise`, `flip`, `trio`, `desk`, `spotlight`.
+  `rise`, `flip`, `trio`, `desk`, `spotlight`, `keyframes`.
+- **Your own motion**: the `keyframes` layout moves one 3D device and the camera through
+  `motion.keys`, a list of `{ "at": 0..1, "x", "y", "size", "pose": [rx, ry, rz],
+  "cam": { "yaw", "pitch", "dist" }, "ease" }`. `at` is a fraction of the whole video; a value
+  a key leaves out holds from the key before; the first key starts from the theme's own pose.
+  Eases: `linear inOutCubic inOutSine outCubic outQuart outBack inOutQuart outExpo`.
+  `--theme keyframes --set 'motion.keys=[{"at":0,"y":1.4,"pose":[0,70,0]},{"at":0.3,"y":0.62,"pose":[4,-20,3],"ease":"outQuart"},{"at":1,"pose":[0,15,0],"cam":{"dist":0.9}}]'`.
+  No animation library is involved: every frame is a pure function of its time, which is what
+  lets frames render out of order. Check a move with `--frames 0,2,mid,end`.
 
 **Custom themes** are JSON (or `.mjs`) files with any subset of theme keys plus `extends`:
 
@@ -245,6 +256,42 @@ write no credits.
 `scripts/models.mjs --from <folder>` re-imports the source GLBs (WebP textures + meshopt
 geometry, credits read from each file's metadata).
 
+### The user's own 3D model
+
+Any `.glb` works as a device, Draco and meshopt compressed files included — the decoders are
+WebAssembly and load only when a file needs them. Convert `.gltf`, `.fbx`,
+`.obj` or `.usdz` to GLB first. A model needs one thing said about it: which part is the
+display.
+
+```bash
+node "$SKILL/scripts/cli.mjs" inspect phone.glb        # materials, meshes, the guessed screen, credit found in the file
+node "$SKILL/scripts/cli.mjs" device-mockup home.png --model phone.glb --set device.pose=0,0,0
+```
+
+- `--model file.glb` makes it the device. `--model-screen <material>` (or `mesh:<name>`)
+  names the display when the guess is wrong or `inspect` reports low confidence;
+  `--model-rotate x,y,z` (degrees) turns a model whose screen faces away or that lies on its
+  side; `--model-kind phone|laptop` overrides sizing (default: by its proportions).
+- **Check with a front render before anything else**: `--set device.pose=0,0,0`, then read the
+  PNG. Screenshot showing, upright, facing you → done. Dark panel → wrong screen material.
+  Back of the device → `--model-rotate 0,180,0`. Lying down → try `90,0,0` or `-90,0,0`.
+- To keep it: put the GLB in `./.app-preview-craft/models/` (or `~/.app-preview-craft/models/`
+  for every project) with a record beside it, `<id>.json`, and use `--device <id>`:
+
+  ```json
+  { "name": "Pixel 9", "file": "pixel-9.glb", "screen": { "material": "Screen" },
+    "rotate": [0, 180, 0], "hide": [{ "material": "Glass" }], "body": ["Frame"],
+    "credit": { "title": "Pixel 9", "author": "…", "license": "CC-BY-4.0", "source": "https://…" } }
+  ```
+
+  `hide` removes cover glass that dims the display, `body` lists the materials `--finish`
+  repaints, `display: [w, h]` overrides the screen shape (default: measured from the mesh),
+  `island: true` draws the Dynamic Island. A project config takes the same records under
+  `"devices": { "<id>": { … } }`. `list devices` shows what is installed.
+- **Credit**: ask where the model came from. A downloaded model almost always needs its
+  author credited (the record's `credit`; `inspect` shows what the file itself states).
+  `CREDITS.txt` carries it, or a line saying no credit is on record — do not remove either.
+
 ## 8. The studio
 
 ```bash
@@ -252,12 +299,54 @@ node "$SKILL/scripts/cli.mjs" studio            # opens http://127.0.0.1:4747/st
 ```
 
 A preview-first editor on localhost, run from the user's project folder: category tabs, the
-live previews (real WebGL), a theme dock, drag-and-drop screenshots/recordings, click-to-edit
-headlines on the preview, drag a 3D device to turn it, a Customize panel generated from the
-same schema as `--set`, export with progress, "Save as theme", "Save app-preview-craft.json", and
-"Copy command" (the exact CLI call). Uploads are saved to `./.app-preview-craft/uploads/`; exports
-go to the folder the studio was started in. Suggest it when the user wants to explore looks;
-run it in the background and give them the URL.
+live previews (the same three.js stage the CLI captures), a theme dock, drag-and-drop
+screenshots/recordings, a Customize panel generated from the same schema as `--set`, export
+with progress, "Save as theme", "Save app-preview-craft.json" and "Copy command" (the exact
+CLI call). Uploads are saved to `./.app-preview-craft/uploads/`; exports go to the folder the
+studio was started in. Suggest it when the user wants to explore looks; run it in the
+background and give them the URL.
+
+The preview is the editor. Tools sit above it:
+
+| Tool | Key | A drag in the preview |
+|---|---|---|
+| Move | `V` | moves the device (`device.x/y`); corner handles or the wheel resize it; arrows nudge; badges and other decor drag too |
+| Turn | `T` | tilts and turns it (`device.pose`); Shift rolls |
+| Camera | `K` | orbits the camera (`scene.camera`); wheel = distance; Shift rolls |
+| Light | `L` | sets where the key light comes from (`scene.key.dir`) |
+
+Text is edited in place. On stills, **All slides / This slide** decides whether a drag
+becomes a theme override or that slide's own `theme`. Lights, camera, pose, position, size,
+finish and glare change on the loaded scene (~1 ms, pixel-identical to a fresh load — the
+selftest checks it); anything else reloads the frame. `⌘Z` / `⇧⌘Z` undo and redo.
+On the `keyframes` theme the scrubber shows the keys: pause anywhere, pose the device or
+camera, and that pose becomes the key at the playhead. Dropping a `.glb` adds the user's own
+model (§7); when the display cannot be guessed, the studio asks them to click it.
+
+### Reading what the user did — the transcript
+
+The studio writes everything done in it to the project, so you can follow along without
+being told:
+
+```bash
+node "$SKILL/scripts/cli.mjs" transcript              # where it stands now + the last 40 steps
+node "$SKILL/scripts/cli.mjs" transcript --json --tail 200
+```
+
+- `.app-preview-craft/studio/transcript.jsonl` — one event per line, `{n, t, type, text, …}`.
+  `text` is the step in words ("Turned iPhone 17 Pro — device.pose = 4, -18, 3"); the other
+  fields are the same thing as data (`path`/`value`, `changes`, `slide`, `scope`, `files`).
+  Types: `session category theme size layout override override.reset preview.edit
+  preview.decor keyframe slide.add slide.screen slide.move slide.remove slide.edit slide.text
+  brand model.add model.update theme.save config.save export.start export.done export.fail
+  undo redo`.
+- `.app-preview-craft/studio/session.json` — the current setup as a project config.
+  **Render exactly what they are looking at:** `cli.mjs --config .app-preview-craft/studio/session.json`
+  (add `--size`, `--format`, `--out` as needed). Its `command` field is the same thing as flags.
+
+After the user says they are done in the studio, run `transcript` before rendering or
+answering questions about "what I changed". An `undo` line means the step before it no longer
+applies — trust `session.json` for the state, the event list for the story.
 
 ## 9. Useful commands
 
@@ -270,6 +359,8 @@ node "$SKILL/scripts/cli.mjs" screen-video flow.mp4 --theme store-preview --size
 node "$SKILL/scripts/cli.mjs" device-mockup home.png --theme noir --transparent --size 3000x2000
 node "$SKILL/scripts/cli.mjs" device-video … --frames 0.5,3,mid     # PNG frames to check motion
 node "$SKILL/scripts/cli.mjs" app-store … --dry-run                 # print the resolved spec
+node "$SKILL/scripts/cli.mjs" inspect model.glb                     # a 3D model's materials and likely screen (§7)
+node "$SKILL/scripts/cli.mjs" transcript                            # what the user did in the studio (§8)
 node "$SKILL/scripts/selftest.mjs" --quick                          # after changing scripts/ or stage/
 ```
 
@@ -288,4 +379,6 @@ the end). Rendering speed on an Apple-silicon GPU is roughly 15–20 frames per 
 | Screenshot cropped oddly | Aspect differs from the device; supply a matching capture or use `--device frameless`. |
 | `layout X makes a video, but … is a still category` | Pick a layout of the right kind (`list layouts`). |
 | Laptop shows a letterboxed phone screen | Add `"desktop": "web.png"` to that slide. |
+| Own model shows a dark panel, its back, or lies down | Wrong screen or orientation: `inspect` it, then `--model-screen` / `--model-rotate` (§7). |
+| `no mesh uses screen material "X"` | The name is not in the model; `inspect` lists the real ones. |
 | Video too fast with many slides | The CLI warns; raise `--duration` or give slides `hold`. |
