@@ -1,7 +1,7 @@
 {
   "name": "app-preview-craft",
   "private": true,
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "Agent skill: App Store and Play Store screenshots, social cards, 3D device mockups and promo videos from app screenshots and recordings.",
   "keywords": [
     "agent-skill",

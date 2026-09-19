@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.3 — 2026-09-20
+
+- **The `trio` phones no longer run through each other.** The side phones took their depth
+  from how far they had fanned, so while the three rose as a stack and began to fan they
+  shared one depth and one spot, and cut into each other frame by frame. Each device now
+  tucks behind the ones in front of it, by its own thickness and pose, over the strip of
+  page the two share (`tuckBehind` in `layouts/common.js`); the settled fan looks as it did.
+  The selftest boxes the three devices every 0.1 s and fails if two intersect.
+
 ## 0.2.2 — 2026-09-20
 
 - **The studio's preview is the editor.** Tools above it — Move, Turn, Camera, Light — make a
