@@ -115,6 +115,49 @@ export function standInFront(ctx, laptop, phone, p, gap = 0.015) {
   return at
 }
 
+/** A placed 3D device as a slab turned about Y: where it is, how it slopes in z, how far it reaches in x and z. */
+function slab(dev, p) {
+  const s = p.size * (p.scale ?? 1)
+  const ry = ((p.ry ?? 0) * Math.PI) / 180
+  const rz = ((p.rz ?? 0) * Math.PI) / 180
+  const cos = Math.max(0.2, Math.abs(Math.cos(ry)))
+  const face = (dev.dims.x * Math.abs(Math.cos(rz)) + dev.dims.y * Math.abs(Math.sin(rz))) * s
+  return {
+    x: p.x,
+    z: p.z ?? 0,
+    tan: Math.sin(ry) / cos,
+    half: (dev.dims.z * s) / 2 / cos,
+    reach: (face * cos + dev.dims.z * s * Math.abs(Math.sin(ry))) / 2,
+  }
+}
+
+/**
+ * The z that passes a 3D device behind the ones already placed in front of it.
+ * Devices at one depth run through each other wherever they share the page —
+ * three phones rising as a stack, or fanning out of one. Only the strip two of
+ * them share counts: a fanned phone swings its outer edge forward, but out
+ * there it has nothing to clear. Returns `p.z`, or less where `p.z` would cut
+ * into one of `fronts` ([{ dev, p }], as placed). The limit eases in as two
+ * devices close on each other, so z stays continuous in t.
+ */
+export function tuckBehind(ctx, dev, p, fronts, gap = 0.012) {
+  if (!dev.dims) return p.z ?? 0
+  const pad = 0.04 * ctx.H
+  const b = slab(dev, p)
+  let back = 0
+  for (const f of fronts) {
+    if (!f.dev.dims) continue
+    const a = slab(f.dev, f.p)
+    const lo = Math.max(a.x - a.reach, b.x - b.reach)
+    const hi = Math.min(a.x + a.reach, b.x + b.reach)
+    // b's face against a's back is linear in x, so the ends of the strip decide it.
+    const slope = Math.min(...[lo, hi].map((x) => (x - b.x) * b.tan - (x - a.x) * a.tan))
+    const limit = a.z - a.half - b.half - gap * ctx.H + slope
+    back = Math.min(back, clamp((hi - lo + pad) / pad) * Math.min(0, limit - b.z))
+  }
+  return b.z + back
+}
+
 /** What a display shows for slide i at `local` seconds into its beat. */
 export async function screenState(ctx, i, local = 0, len = 1, { desktop = false } = {}) {
   const n = ctx.sources.length
