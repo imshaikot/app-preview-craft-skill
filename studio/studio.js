@@ -1,7 +1,11 @@
 // app-preview-craft studio. The previews are live stage.html pages; this file only
 // owns state (category, theme, overrides, slides) and turns it into specs.
+//
+// Every change goes through record(): one step of undo history, and one line of
+// the transcript the server keeps in .app-preview-craft/studio/ for the agent.
 import { getPath, isObj, merge, resolveTheme, setPath } from '/stage/catalog/resolve.js'
 import { fontStack } from '/stage/catalog/fonts.js'
+import { KEY_SNAP, keysOf, keyTrack } from '/stage/lib/keys.js'
 
 const $ = (s, el = document) => el.querySelector(s)
 const $$ = (s, el = document) => [...el.querySelectorAll(s)]
@@ -18,6 +22,8 @@ const h = (tag, attrs = {}, ...kids) => {
   for (const kid of kids.flat()) if (kid != null && kid !== false) el.append(kid.nodeType ? kid : document.createTextNode(kid))
   return el
 }
+/** replaceChildren that skips null and false, which the DOM would print as text. */
+const fill = (el, ...kids) => el.replaceChildren(...kids.flat().filter((k) => k != null && k !== false))
 const ICON = {
   left: '<svg viewBox="0 0 24 24"><path d="M15 6l-6 6 6 6"/></svg>',
   right: '<svg viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg>',
@@ -28,6 +34,14 @@ const ICON = {
   reset: '<svg viewBox="0 0 24 24"><path d="M4 12a8 8 0 1 0 3-6.2M4 4v5h5"/></svg>',
   play: '<svg viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>',
   pause: '<svg viewBox="0 0 24 24"><path d="M7 5h4v14H7zM13 5h4v14h-4z"/></svg>',
+  move: '<svg viewBox="0 0 24 24"><path d="M12 3v18M3 12h18M12 3l-3 3M12 3l3 3M12 21l-3-3M12 21l3-3M3 12l3-3M3 12l3 3M21 12l-3-3M21 12l-3 3"/></svg>',
+  turn: '<svg viewBox="0 0 24 24"><path d="M20 12a8 8 0 1 1-2.6-5.9M20 4v5h-5"/></svg>',
+  camera: '<svg viewBox="0 0 24 24"><path d="M3 8h4l2-3h6l2 3h4v11H3z"/><circle cx="12" cy="13" r="3.5"/></svg>',
+  light: '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M5 5l2 2M17 17l2 2M19 5l-2 2M7 17l-2 2"/></svg>',
+  undo: '<svg viewBox="0 0 24 24"><path d="M9 7 4 12l5 5M4 12h10a6 6 0 0 1 0 12"/></svg>',
+  redo: '<svg viewBox="0 0 24 24"><path d="m15 7 5 5-5 5M20 12H10a6 6 0 0 0 0 12"/></svg>',
+  key: '<svg viewBox="0 0 24 24"><path d="M12 3l8 9-8 9-8-9z"/></svg>',
+  pick: '<svg viewBox="0 0 24 24"><path d="M5 3l6 16 2.5-6.5L20 10z"/></svg>',
 }
 
 /* ── state ─────────────────────────────────────────────────────────────── */
@@ -36,6 +50,8 @@ const boot = await fetch('/api/state').then((r) => r.json())
 const { catalog } = boot
 const THEMES = boot.themes
 const custom = { ...boot.custom }
+// The person's own 3D models: id -> record, a URL for the GLB, and what is inside it.
+const ownDevices = { ...boot.devices }
 const STORE = `app-preview-craft-studio:${boot.cwd}`
 
 const initial = (() => {
@@ -58,9 +74,32 @@ const state = {
   tab: 'slides',
   panel: initial.panel ?? false,
   export: initial.export ?? {},
+  tool: 'move',
+  scope: 'all',
 }
 if (boot.project?.config?.theme && typeof boot.project.config.theme === 'string' && !initial.themeByCat) {
   state.themeByCat[state.category] = boot.project.config.theme
+}
+// Slides kept in the browser carry /file URLs from the server process that made them.
+// Ask this one to describe the files again, or every restart shows broken images.
+if (state.slides?.length) {
+  const kept = state.slides.flatMap((s) => [s.screen?.path, s.desktop?.path]).filter(Boolean)
+  const { files = {} } = await fetch('/api/restore', { method: 'POST', body: JSON.stringify({ paths: kept }) })
+    .then((r) => r.json())
+    .catch(() => ({}))
+  const gone = []
+  for (const s of state.slides) {
+    for (const key of ['screen', 'desktop']) {
+      const p = s[key]?.path
+      if (!p) continue
+      if (files[p] && !files[p].error) s[key] = files[p]
+      else {
+        gone.push(p.split('/').pop())
+        s[key] = undefined
+      }
+    }
+  }
+  if (gone.length) boot.lost = gone
 }
 const usingSamples = () => !state.slides?.length
 const slides = () => (usingSamples() ? (boot.samples[currentThemeRaw().samples] ?? boot.samples.slides) : state.slides)
@@ -78,9 +117,100 @@ let saveTimer
 function save() {
   clearTimeout(saveTimer)
   saveTimer = setTimeout(() => {
-    const { focus, index, ...rest } = state
+    const { focus, index, tool, scope, ...rest } = state
     localStorage.setItem(STORE, JSON.stringify(rest))
   }, 200)
+}
+
+/* ── history and transcript ────────────────────────────────────────────── */
+
+// What undo restores. View state (focus, panel, tool) is not part of the work.
+const UNDOABLE = ['category', 'themeByCat', 'overridesByCat', 'sizeByCat', 'slides', 'brand']
+const snapshot = () => JSON.stringify(Object.fromEntries(UNDOABLE.map((k) => [k, state[k]])))
+const history = [{ snap: snapshot(), text: 'Opened the studio' }]
+let cursor = 0
+const events = [...(boot.transcript?.events ?? [])]
+let outbox = []
+let flushTimer
+
+const show = (v) => (Array.isArray(v) ? v.map((x) => (isObj(x) ? '{…}' : x)).join(', ') : isObj(v) ? JSON.stringify(v) : String(v))
+
+/**
+ * Note a change: `text` is the sentence the transcript shows, `data` the same
+ * thing as fields. `coalesce` names a stream (a slider being dragged): steps
+ * in one stream within a moment of each other replace the last instead of
+ * piling up, in the history and in the transcript both.
+ */
+function record(type, text, data = {}, { coalesce = null, undoable = true } = {}) {
+  const now = Date.now()
+  const event = { type, text, ...data }
+  if (undoable) {
+    const snap = snapshot()
+    const top = history[cursor]
+    if (snap === top.snap) return
+    if (coalesce && top.coalesce === coalesce && now - top.at < 1500) Object.assign(top, { snap, text, at: now })
+    else {
+      history.length = cursor + 1
+      history.push({ snap, text, coalesce, at: now })
+      cursor++
+    }
+  }
+  const pending = outbox.at(-1)
+  if (coalesce && pending?.coalesce === coalesce && now - pending.at < 1500) outbox[outbox.length - 1] = { ...event, coalesce, at: now }
+  else outbox.push({ ...event, coalesce, at: now })
+  clearTimeout(flushTimer)
+  flushTimer = setTimeout(flush, 700)
+  updateHistoryUi()
+}
+
+async function flush() {
+  const batch = outbox.map(({ coalesce, at, ...e }) => e)
+  outbox = []
+  if (!batch.length) return
+  try {
+    const r = await fetch('/api/transcript', { method: 'POST', body: JSON.stringify({ events: batch, session: sessionNow() }) }).then((x) => x.json())
+    events.push(...(r.events ?? []))
+  } catch {
+    events.push(...batch.map((e) => ({ ...e, t: new Date().toISOString(), unsaved: true })))
+  }
+  if (state.tab === 'history') renderHistoryPane()
+}
+// A closing tab still gets its last lines out.
+window.addEventListener('pagehide', () => {
+  const batch = outbox.map(({ coalesce, at, ...e }) => e)
+  if (batch.length) navigator.sendBeacon('/api/transcript', JSON.stringify({ events: batch, session: sessionNow() }))
+})
+
+/** Where the studio stands, as a project config the CLI renders as is. */
+function sessionNow() {
+  const j = jobFor()
+  return { category: j.category, theme: j.theme, themeOverrides: j.themeOverrides, size: j.size, format: j.format, transparent: j.transparent, index: j.index, brand: j.brand, out: j.out, slides: usingSamples() ? undefined : j.slides, ownModels: Object.keys(ownDevices), command: cliCommand() }
+}
+
+function travel(step) {
+  const next = cursor + step
+  if (next < 0 || next >= history.length) return
+  const undone = history[step < 0 ? cursor : next].text
+  cursor = next
+  Object.assign(state, JSON.parse(history[cursor].snap))
+  state.focus = null
+  state.index = Math.min(state.index, Math.max(0, slides().length - 1))
+  save()
+  pause()
+  renderAll()
+  record(step < 0 ? 'undo' : 'redo', `${step < 0 ? 'Undid' : 'Redid'}: ${undone}`, {}, { undoable: false })
+  toast({ title: `${step < 0 ? 'Undid' : 'Redid'}: ${undone}`, timeout: 1600 })
+}
+const undo = () => travel(-1)
+const redo = () => travel(1)
+
+function updateHistoryUi() {
+  const u = $('#btn-undo')
+  if (!u) return
+  u.disabled = cursor === 0
+  u.title = cursor ? `Undo: ${history[cursor].text} (⌘Z)` : 'Nothing to undo'
+  $('#btn-redo').disabled = cursor >= history.length - 1
+  $('#btn-redo').title = cursor < history.length - 1 ? `Redo: ${history[cursor + 1].text} (⇧⌘Z)` : 'Nothing to redo'
 }
 
 function theme() {
@@ -147,6 +277,7 @@ async function buildSpec(index, pixelRatio) {
     editable: true,
     assetBase: '/',
     screenScale: 0.6,
+    devices: Object.fromEntries(Object.entries(ownDevices).map(([id, { inspect, ...def }]) => [id, def])),
   }
 }
 
@@ -196,6 +327,8 @@ function layoutFrames() {
 }
 
 function buildFrames() {
+  resumeAfterLoad = true
+  $('#scrub').value = 0
   for (const f of frames) f.el.remove()
   canvas.innerHTML = ''
   frames = []
@@ -225,9 +358,7 @@ function buildFrames() {
     )
     const el = h('div', { class: 'frame', 'data-index': i }, wrap, meta)
     const f = { el, wrap, iframe, index: i, ready: false, loadId: 0, scale: 1 }
-    iframe.addEventListener('load', () => {})
     el.addEventListener('dblclick', () => set && toggleFocus(i))
-    attachRotate(f)
     frames.push(f)
     canvas.append(el)
   }
@@ -237,6 +368,7 @@ function buildFrames() {
     )
   }
   canvas.append(h('div', { class: 'spacer-r' }))
+  renderTools()
   layoutFrames()
   refreshAll()
   renderSlidePicker()
@@ -260,29 +392,70 @@ window.addEventListener('message', (e) => {
       f.el.classList.remove('busy')
       $('.error', f.wrap)?.remove()
       f.info = msg.info
+      f.loaded = true
+      sendTool(f)
+      for (const w of msg.info.warnings ?? []) if (/no screen is set/.test(w)) noteOnce(w)
       if (isVideo()) onVideoLoaded(f)
       break
     case 'stage:error':
       if (msg.id !== f.loadId) return
       f.el.classList.remove('busy')
+      f.loaded = false
       $('.error', f.wrap)?.remove()
       f.wrap.append(h('div', { class: 'error' }, msg.error))
+      break
+    case 'stage:patched':
+      if (msg.id !== f.patchId) return
+      f.patching = false
+      // Something in the change builds DOM or geometry: load it properly.
+      if (!msg.exact) refresh(f)
+      else if (f.patchAgain) retune(f)
       break
     case 'stage:edit': {
       const list = ensureOwnSlides()
       if (!list[msg.index]) return
       list[msg.index][msg.field] = msg.value
       save()
+      record('slide.text', `Slide ${msg.index + 1} ${msg.field}: “${String(msg.value).replace(/\*/g, '')}”`, { slide: msg.index + 1, field: msg.field, value: msg.value })
       renderSlidesPane()
       // Other frames show this text only in video captions; refresh the rest.
       refreshAll({ except: cat().set ? f : null })
       break
     }
+    case 'stage:change':
+      onStageChange(f, msg)
+      break
+    case 'stage:decor':
+      onDecorMoved(f, msg)
+      break
+    case 'stage:select':
+      state.selected = msg.device
+      break
+    case 'stage:devices':
+      f.devices = msg.devices
+      break
+    case 'stage:picked':
+      onPicked(msg)
+      break
+    case 'stage:hover':
+      $('#pick-hover') && ($('#pick-hover').textContent = msg.material != null ? `material “${msg.material || '(unnamed)'}” · mesh “${msg.mesh || '(unnamed)'}”` : 'Hover the model, click its display')
+      break
+    case 'stage:key':
+      // The preview has the keyboard focus; shortcuts still belong to the studio.
+      onKey({ key: msg.key, shiftKey: msg.shift, metaKey: msg.meta, ctrlKey: msg.ctrl, target: document.body, preventDefault() {} })
+      break
     case 'stage:time':
       if (f === frames[0]) setTime(msg.time)
       break
   }
 })
+
+const noted = new Set()
+function noteOnce(text) {
+  if (noted.has(text)) return
+  noted.add(text)
+  toast({ title: text, timeout: 6000 })
+}
 
 let refreshTimer
 function refreshAll({ except = null, delay = 120 } = {}) {
@@ -294,58 +467,102 @@ async function refresh(f) {
   if (!f.ready) return
   const id = ++loadSeq
   f.loadId = id
+  f.loaded = false
+  f.patching = false
   f.el.classList.add('busy')
   const pr = Math.max(0.5, Math.min(1.5, f.scale * devicePixelRatio))
   const index = cat().set ? f.index : Math.min(state.index, slides().length - 1)
   const spec = await buildSpec(index, pr)
+  spec.viewScale = f.scale
   if (f.loadId !== id) return
+  // A still has no clock to restart; a video picks up where the scrubber is.
+  spec.time = isVideo() && duration ? (Number($('#scrub').value) / 1000) * duration : 0
+  if (playing) resumeAfterLoad = true
   playing = false
   updatePlayButton()
   f.iframe.contentWindow.postMessage({ type: 'stage:load', id, spec }, '*')
 }
 
-/* ── drag to rotate a 3D device ────────────────────────────────────────── */
+/**
+ * Show a theme change. A loaded stage takes lights, camera, pose, position and
+ * size in place (stage.patch), which is what makes sliders and drags feel live;
+ * it answers exact: false for anything that builds DOM or geometry, and that
+ * frame loads instead. Either way the pixels are what a render of it gives.
+ */
+function retune(f) {
+  if (!f.loaded) return refresh(f)
+  if (f.patching) {
+    f.patchAgain = true
+    return
+  }
+  f.patching = true
+  f.patchAgain = false
+  f.patchId = ++loadSeq
+  f.iframe.contentWindow.postMessage({ type: 'stage:patch', id: f.patchId, theme: theme() }, '*')
+}
+const retuneAll = ({ except = null } = {}) => frames.forEach((f) => f !== except && retune(f))
 
-function attachRotate(f) {
-  let start = null
-  let moved = false
-  const t = () => theme()
-  f.wrap.addEventListener('pointerdown', (e) => {
-    if (t().device.mode !== '3d' || e.button !== 0) return
-    if (e.target.closest?.('[contenteditable]')) return
-    start = { x: e.clientX, y: e.clientY, lx: e.clientX, ly: e.clientY }
-    moved = false
-  })
-  window.addEventListener('pointermove', (e) => {
-    if (!start) return
-    const dx = e.clientX - start.lx
-    const dy = e.clientY - start.ly
-    if (!moved && Math.hypot(e.clientX - start.x, e.clientY - start.y) < 4) return
-    moved = true
-    f.el.classList.add('dragging-3d')
-    start.lx = e.clientX
-    start.ly = e.clientY
-    const k = 0.012
-    f.iframe.contentWindow.postMessage({ type: 'stage:nudge', dx: dx * k, dy: dy * k }, '*')
-  })
-  window.addEventListener('pointerup', (e) => {
-    if (!start) return
-    const s = start
-    start = null
-    f.el.classList.remove('dragging-3d')
-    if (!moved) return
-    const deg = 0.012 * (180 / Math.PI)
-    const pose = [...(t().device.pose ?? [0, 0, 0])]
-    pose[0] += (e.clientY - s.y) * deg
-    pose[1] += (e.clientX - s.x) * deg
-    setOverride('device.pose', pose.map((v) => Math.round(v * 10) / 10))
-  })
+function sendTool(f) {
+  f.iframe.contentWindow.postMessage({ type: 'stage:tool', tool: state.tool, scope: cat().kind === 'still' ? state.scope : 'all' }, '*')
+}
+
+/* ── edits made in the preview (stage/lib/editor.js) ───────────────────── */
+
+const pathLabel = (path) => {
+  const f = catalog.schema.find((x) => x.path === path)
+  return f ? `${f.group} › ${f.label}` : path
+}
+
+function onStageChange(f, msg) {
+  const perSlide = msg.scope === 'slide' && cat().kind === 'still'
+  if (perSlide) {
+    const list = ensureOwnSlides()
+    const sl = list[msg.index]
+    if (!sl) return
+    for (const c of msg.changes) sl.theme = setPath(sl.theme ?? {}, c.path, c.value)
+  } else {
+    for (const c of msg.changes) state.overridesByCat[state.category] = setPath(overrides(), c.path, c.value)
+  }
+  save()
+  for (const c of msg.changes) syncField(c.path, c.value)
+  if (msg.changes.some((c) => c.path === 'motion.keys')) renderKeys()
+  // The frame that was dragged already shows it (or said it cannot, and reloads).
+  if (!msg.exact && msg.final) refresh(f)
+  if (!msg.final) return
+  if (!perSlide) retuneAll({ except: f })
+  const what = msg.changes.map((c) => (c.path === 'motion.keys' ? `${c.value.length} keyframes` : `${c.path} = ${show(c.value)}`)).join(' · ')
+  record('preview.edit', `${msg.label ?? 'Edited in the preview'}${perSlide ? ` (slide ${msg.index + 1} only)` : ''} — ${what}`, { changes: msg.changes, scope: perSlide ? 'slide' : 'all', slide: perSlide ? msg.index + 1 : undefined })
+  if (state.tab === 'style') renderStylePane()
+  if (perSlide && state.tab === 'slides') renderSlidesPane()
+}
+
+function onDecorMoved(f, msg) {
+  const at = { x: msg.x, y: msg.y }
+  let kind
+  if (msg.source === 'slide') {
+    const sl = ensureOwnSlides()[msg.index]
+    if (!sl?.decor?.[msg.n]) return
+    sl.decor = sl.decor.map((d, i) => (i === msg.n ? { ...d, ...at } : d))
+    kind = sl.decor[msg.n].kind
+  } else {
+    const list = (theme().decor ?? []).map((d, i) => (i === msg.n ? { ...d, ...at } : d))
+    if (!list[msg.n]) return
+    kind = list[msg.n].kind
+    state.overridesByCat[state.category] = setPath(overrides(), 'decor', list)
+  }
+  save()
+  refreshAll({ except: msg.source === 'slide' ? f : null })
+  record('preview.decor', `Moved the ${kind} decoration${msg.source === 'slide' ? ` on slide ${msg.index + 1}` : ''} to x ${msg.x}, y ${msg.y}`, { decor: msg.n, source: msg.source, ...at })
+  if (state.tab === 'style') renderStylePane()
 }
 
 /* ── video transport ───────────────────────────────────────────────────── */
 
 let playing = false
 let duration = 0
+// A reload in the middle of an edit stays where the scrubber is; only a video
+// that was running (or a fresh set of frames) starts playing when it lands.
+let resumeAfterLoad = true
 function onVideoLoaded(f) {
   duration = f.info.duration
   const beats = $('#beats')
@@ -364,8 +581,79 @@ function onVideoLoaded(f) {
     beats.append(h('i', { style: { left: `${(at / duration) * 100}%` } }), h('span', { style: { left: `${(at / duration) * 100}%` } }, String(i + 1)))
     at += l ?? each
   })
-  setTime(0)
-  play()
+  renderKeys()
+  setTime((Number($('#scrub').value) / 1000) * duration)
+  if (resumeAfterLoad) play()
+  resumeAfterLoad = false
+}
+
+/* keyframes: markers on the scrubber, for themes on the `keyframes` layout */
+
+const isKeyed = () => isVideo() && theme().layout === 'keyframes'
+const EASES = ['linear', 'inOutCubic', 'inOutSine', 'outCubic', 'outQuart', 'outBack', 'inOutQuart', 'outExpo']
+const playhead = () => Number($('#scrub').value) / 1000
+
+function renderKeys() {
+  const box = $('#keys')
+  const bar = $('#keybar')
+  fill(box)
+  bar.hidden = !isKeyed()
+  document.body.classList.toggle('keyed', isKeyed())
+  if (!isKeyed()) return
+  const own = !!theme().motion.keys?.length
+  const keys = keysOf(theme())
+  const near = keys.findIndex((k) => Math.abs((k.at ?? 0) - playhead()) < KEY_SNAP)
+  keys.forEach((k, i) => {
+    const b = h('button', { class: `keymark${i === near ? ' on' : ''}${own ? '' : ' implied'}`, style: { left: `${(k.at ?? 0) * 100}%` }, title: `Key at ${Math.round((k.at ?? 0) * 100)}% — click to go there`, onclick: () => seekTo((k.at ?? 0) * duration) })
+    box.append(b)
+  })
+  const key = near >= 0 ? keys[near] : null
+  fill(bar,
+    h('button', { class: 'chip', title: 'Pose the device or camera, then keep that pose here (also made by any drag)', onclick: () => keyOp({ op: 'add' }) }, h('span', { html: ICON.key }), key && own ? 'Key here ✓' : 'Add key here'),
+    key && own
+      ? h('select', { class: 'in small', title: 'How the move eases into this key', onchange: (e) => keyOp({ op: 'ease', ease: e.target.value }) }, ...EASES.map((x) => h('option', { value: x, selected: x === (key.ease ?? 'inOutCubic') }, x)))
+      : null,
+    key && own ? h('button', { class: 'chip', onclick: () => keyOp({ op: 'remove' }) }, 'Remove key') : null,
+    h('span', { class: 'dim' }, !own ? 'Default move — drag the device at any moment to make your own.' : `${keys.length} keys · drag the device or use the camera tool to pose a key at the playhead`),
+  )
+}
+
+/** Key edits at the playhead, stored like any override. */
+function keyOp({ op, ease }) {
+  const t = theme()
+  const at = Math.round(playhead() * 1000) / 1000
+  const keys = structuredClone(keysOf(t))
+  const i = keys.findIndex((k) => Math.abs((k.at ?? 0) - at) < KEY_SNAP)
+  let text
+  if (op === 'add') {
+    if (i >= 0) return toast({ title: 'There is already a key here — drag the device to change it', timeout: 2500 })
+    // The pose the move passes through here becomes a key of its own: nothing jumps, and it is now there to edit.
+    const v = keyTrack(keys, t)(at)
+    const r = (x, n = 3) => Math.round(x * 10 ** n) / 10 ** n
+    keys.push({ at, x: r(v.x), y: r(v.y), size: r(v.size), pose: [r(v.rx, 1), r(v.ry, 1), r(v.rz, 1)], cam: { yaw: r(v.yaw, 1), pitch: r(v.pitch, 1), dist: r(v.dist) } })
+    text = `Added a keyframe at ${Math.round(at * 100)}%`
+  } else if (op === 'remove' && i >= 0) {
+    if (keys.length <= 1) return toast({ title: 'A move needs at least one key', timeout: 2500 })
+    keys.splice(i, 1)
+    text = `Removed the keyframe at ${Math.round(at * 100)}%`
+  } else if (op === 'ease' && i >= 0) {
+    keys[i].ease = ease
+    text = `Keyframe at ${Math.round(at * 100)}% eases ${ease}`
+  } else return
+  keys.sort((a, b) => (a.at ?? 0) - (b.at ?? 0))
+  state.overridesByCat[state.category] = setPath(overrides(), 'motion.keys', keys)
+  save()
+  retuneAll()
+  renderKeys()
+  record('keyframe', text, { at, keys })
+}
+
+function seekTo(t) {
+  pause()
+  $('#scrub').value = duration ? Math.round((t / duration) * 1000) : 0
+  $('#time').textContent = `${t.toFixed(1)} / ${duration.toFixed(1)}s`
+  frames[0]?.iframe.contentWindow.postMessage({ type: 'stage:seek', time: t, fast: true }, '*')
+  renderKeys()
 }
 function setTime(t) {
   $('#time').textContent = `${t.toFixed(1)} / ${duration.toFixed(1)}s`
@@ -395,7 +683,10 @@ $('#scrub').addEventListener('input', () => {
   $('#time').textContent = `${t.toFixed(1)} / ${duration.toFixed(1)}s`
   frames[0]?.iframe.contentWindow.postMessage({ type: 'stage:seek', time: t, fast: true }, '*')
 })
-$('#scrub').addEventListener('change', () => (scrubbing = false))
+$('#scrub').addEventListener('change', () => {
+  scrubbing = false
+  renderKeys()
+})
 
 /* ── top bar ───────────────────────────────────────────────────────────── */
 
@@ -411,12 +702,12 @@ function renderCats() {
       ),
     )
   }
-  $('#cats').replaceChildren(inner)
+  fill($('#cats'), inner)
 }
 
 function renderSizes() {
   const sel = $('#size')
-  sel.replaceChildren(
+  fill(sel,
     ...cat().sizes.map((k) => {
       const s = catalog.sizes[k]
       return h('option', { value: k, selected: k === sizeKey() }, `${s.label} · ${s.w}×${s.h}`)
@@ -427,6 +718,7 @@ $('#size').onchange = (e) => {
   state.sizeByCat[state.category] = e.target.value
   save()
   buildFrames()
+  record('size', `Size: ${size().label ?? size().key} (${size().w}×${size().h})`, { size: e.target.value })
 }
 
 function setCategory(id) {
@@ -437,14 +729,17 @@ function setCategory(id) {
   state.index = 0
   save()
   renderAll()
+  record('category', `Switched to ${cat().name} (theme ${themeId()})`, { category: id, theme: themeId() })
 }
 
 function renderAll() {
   renderCats()
   renderSizes()
   renderThemes()
+  renderTools()
   buildFrames()
   renderPanel()
+  renderKeys()
 }
 
 /* ── theme dock ────────────────────────────────────────────────────────── */
@@ -454,7 +749,7 @@ function renderThemes() {
   $('#theme-label').textContent = `${cat().name}`
   $('#theme-meta').textContent = `${list.length} themes · ${currentThemeRaw().name ?? themeId()}${currentThemeRaw().inspiredBy ? ` — inspired by ${currentThemeRaw().inspiredBy.split(' — ')[0]}` : ''}`
   const box = $('#themes')
-  box.replaceChildren(
+  fill(box,
     ...list.map((raw) => {
       const t = resolveTheme(state.category, raw.id, { custom })
       const p = t.palette
@@ -508,6 +803,7 @@ function setTheme(id) {
   renderThemes()
   buildFrames()
   renderPanel()
+  record('theme', `Theme: ${currentThemeRaw().name ?? id}${had ? ` (cleared ${had} tweak group${had > 1 ? 's' : ''})` : ''}`, { theme: id })
   if (had) {
     toast({
       title: 'Theme switched — your tweaks were cleared',
@@ -519,6 +815,7 @@ function setTheme(id) {
             save()
             buildFrames()
             renderPanel()
+            record('overrides.keep', `Kept the earlier tweaks on ${currentThemeRaw().name ?? id}`, { overrides: previous.overrides })
           },
         },
       ],
@@ -536,8 +833,10 @@ $('#shuffle').onclick = () => {
 function setOverride(path, value) {
   state.overridesByCat[state.category] = setPath(overrides(), path, value)
   save()
-  refreshAll()
+  retuneAll()
   syncField(path)
+  if (path === 'motion.keys' || path === 'layout') renderKeys()
+  record('override', `${pathLabel(path)} = ${show(value)}`, { path, value }, { coalesce: path })
 }
 function clearOverride(path) {
   const o = merge(overrides())
@@ -560,8 +859,10 @@ function clearOverride(path) {
   prune(o)
   state.overridesByCat[state.category] = o
   save()
-  refreshAll()
+  retuneAll()
   renderPanel()
+  renderKeys()
+  record('override.reset', `Reset ${pathLabel(path)} to the theme's value`, { path })
 }
 
 /* ── slides ────────────────────────────────────────────────────────────── */
@@ -601,6 +902,7 @@ async function addFiles(files) {
     t.close()
     buildFrames()
     renderPanel()
+    record('slide.add', `Added ${files.length} screen${files.length > 1 ? 's' : ''}: ${files.map((f) => f.name).join(', ')}`, { files: list.slice(-files.length).map((x) => x.screen.path) })
   } catch (err) {
     t.close()
     toast({ title: 'Upload failed', sub: String(err.message ?? err), error: true })
@@ -614,6 +916,7 @@ async function replaceScreen(i, file, key = 'screen') {
     save()
     buildFrames()
     renderPanel()
+    record('slide.screen', `Slide ${i + 1}: ${key === 'desktop' ? 'desktop screen' : 'screen'} is now ${file.name}`, { slide: i + 1, key, file: list[i][key].path })
   } catch (err) {
     toast({ title: 'Upload failed', sub: String(err.message ?? err), error: true })
   }
@@ -633,6 +936,7 @@ function moveSlide(i, d) {
   save()
   buildFrames()
   renderPanel()
+  record('slide.move', `Moved slide ${i + 1} to position ${j + 1}`, { from: i + 1, to: j + 1 })
 }
 function removeSlide(i) {
   const list = ensureOwnSlides()
@@ -641,11 +945,8 @@ function removeSlide(i) {
   save()
   buildFrames()
   renderPanel()
-  toast({
-    title: 'Slide removed',
-    timeout: 4000,
-    actions: [{ label: 'Undo', run: () => (list.splice(i, 0, gone), save(), buildFrames(), renderPanel()) }],
-  })
+  record('slide.remove', `Removed slide ${i + 1}${gone.title ? ` (“${String(gone.title).replace(/\*/g, '')}”)` : ''}`, { slide: i + 1 })
+  toast({ title: 'Slide removed', timeout: 4000, actions: [{ label: 'Undo', run: undo }] })
 }
 function toggleFocus(i) {
   state.focus = state.focus === i ? null : i
@@ -680,6 +981,9 @@ window.addEventListener('drop', (e) => {
   e.preventDefault()
   dragDepth = 0
   $('#drop').hidden = true
+  const model = [...e.dataTransfer.files].find((f) => /\.glb$/i.test(f.name))
+  if (model) return addModel(model)
+  if ([...e.dataTransfer.files].some((f) => /\.(gltf|fbx|obj|usdz|blend)$/i.test(f.name))) return toast({ title: 'Models need to be .glb', sub: 'Export or convert it to binary glTF, then drop it here.', error: true })
   const files = [...e.dataTransfer.files].filter((f) => /^(image|video)\//.test(f.type) || /\.(png|jpe?g|webp|mp4|mov|webm)$/i.test(f.name))
   if (!files.length) return
   // Dropped on a frame of a set: replace that slide's screen.
@@ -712,6 +1016,7 @@ function renderPanel() {
   if (state.tab === 'slides') renderSlidesPane()
   if (state.tab === 'style') renderStylePane()
   if (state.tab === 'output') renderOutputPane()
+  if (state.tab === 'history') renderHistoryPane()
 }
 
 function input(value, onchange, attrs = {}) {
@@ -730,7 +1035,7 @@ function renderSlidesPane() {
   const pane = $('#pane-slides')
   const list = slides()
   const video = isVideo()
-  pane.replaceChildren(
+  fill(pane,
     h('div', { class: 'section-title' }, `Slides (${list.length})`, h('span', { class: 'spacer' }), h('button', { class: 'btn small ghost', onclick: () => pickFiles(addFiles) }, h('span', { html: ICON.plus }), 'Add')),
     usingSamples() ? h('p', { class: 'note' }, 'Showing the bundled sample app. Drop your own screenshots or recordings to replace it — edits here copy the samples into your project.') : null,
     ...list.map((s, i) => {
@@ -738,6 +1043,7 @@ function renderSlidesPane() {
         ensureOwnSlides()[i][k] = v === '' ? undefined : v
         save()
         refreshAll()
+        record('slide.edit', `Slide ${i + 1} ${k}: ${v === '' ? 'cleared' : show(v)}`, { slide: i + 1, field: k, value: v === '' ? null : v })
       }
       const thumb = s.screen?.kind === 'video' ? `${s.screen.frames.base}00001.jpg` : s.screen?.url
       return h(
@@ -792,7 +1098,7 @@ function renderSlidesPane() {
     h('div', { class: 'section-title' }, 'Brand'),
     h('p', { class: 'note' }, 'Used by intro/outro cards, logo and store badges.'),
     ...['name', 'tagline', 'cta', 'url'].map((k) =>
-      h('div', { class: 'field' }, h('label', {}, k[0].toUpperCase() + k.slice(1)), input(brand()[k], (v) => ((state.brand = { ...brand(), [k]: v || undefined }), save(), refreshAll())), h('span')),
+      h('div', { class: 'field' }, h('label', {}, k[0].toUpperCase() + k.slice(1)), input(brand()[k], (v) => ((state.brand = { ...brand(), [k]: v || undefined }), save(), refreshAll(), record('brand', `Brand ${k}: ${v || 'cleared'}`, { field: k, value: v || null }))), h('span')),
     ),
   )
 }
@@ -815,7 +1121,7 @@ function renderStylePane() {
       { class: 'section-title' },
       currentThemeRaw().name ?? themeId(),
       h('span', { class: 'spacer' }),
-      h('button', { class: 'btn small ghost', onclick: () => ((state.overridesByCat[state.category] = {}), save(), refreshAll(), renderPanel()) }, h('span', { html: ICON.reset }), 'Reset'),
+      h('button', { class: 'btn small ghost', onclick: () => ((state.overridesByCat[state.category] = {}), save(), retuneAll(), renderPanel(), renderKeys(), record('overrides.reset', `Reset every tweak on ${currentThemeRaw().name ?? themeId()}`)) }, h('span', { html: ICON.reset }), 'Reset'),
       h('button', { class: 'btn small ghost', onclick: saveTheme }, 'Save as theme'),
     ),
     currentThemeRaw().inspiredBy ? h('p', { class: 'note' }, `Inspired by ${currentThemeRaw().inspiredBy}`) : null,
@@ -833,6 +1139,8 @@ function renderStylePane() {
             save()
             refreshAll()
             renderPanel()
+            renderKeys()
+            record('layout', `Layout: ${id} — ${catalog.layouts[id].label}`, { layout: id })
           },
         },
         ...layouts.map(([id, l]) => h('option', { value: id, selected: id === t.layout }, `${id} — ${l.label}`)),
@@ -857,20 +1165,23 @@ function renderStylePane() {
     })
     return det
   })
+  const own = ownDevices[t.device.model] && t.device.mode === '3d' ? modelSetup(t.device.model) : null
   const raw = h('details', { class: 'group' }, h('summary', {}, 'Raw overrides (JSON)'), h('p', { class: 'note' }, 'Everything above lands here. Any theme key works — scene.rims, background.shapes, bento, wall…'))
   raw.append(
     textarea(JSON.stringify(o, null, 2), (v) => {
       try {
         state.overridesByCat[state.category] = v.trim() ? JSON.parse(v) : {}
         save()
-        refreshAll()
+        retuneAll()
         renderPanel()
+        renderKeys()
+        record('overrides.raw', 'Edited the raw overrides JSON', { overrides: overrides() })
       } catch (err) {
         toast({ title: 'Not valid JSON', sub: err.message, error: true })
       }
     }, { class: 'in code', rows: 10 }),
   )
-  pane.replaceChildren(top, ...sections, raw)
+  fill(pane, top, ...(own ? [own] : []), ...sections, raw)
 }
 
 function fieldControl(f, t, o) {
@@ -905,26 +1216,30 @@ function fieldControl(f, t, o) {
       break
     }
     case 'select':
-    case 'font':
+    case 'font': {
+      const options = f.path === 'device.model' ? [...f.options, ...Object.keys(ownDevices)] : f.options
       ctl = h(
         'select',
         { class: 'in', onchange: (e) => set(typeof f.options[0] === 'number' ? Number(e.target.value) : e.target.value) },
-        ...f.options.map((x) => h('option', { value: x, selected: String(x) === String(value) }, f.type === 'font' ? `${x} — ${catalog.fonts[x].kind}` : String(x))),
+        ...options.map((x) => h('option', { value: x, selected: String(x) === String(value) }, f.type === 'font' ? `${x} — ${catalog.fonts[x].kind}` : ownDevices[x] ? `${x} — yours` : String(x))),
       )
+      if (f.path === 'device.model') ctl = h('div', { class: 'ctl col' }, ctl, h('button', { class: 'btn small ghost', onclick: () => pickModel() }, h('span', { html: ICON.plus }), 'Add your own 3D model (.glb)'))
       break
+    }
     case 'bool': {
       const cb = h('input', { type: 'checkbox', checked: !!value })
       cb.addEventListener('change', () => set(cb.checked))
       ctl = h('label', { class: 'toggle' }, cb, h('span'))
       break
     }
+    case 'vec3':
     case 'pose': {
       const p = value ?? [0, 0, 0]
       ctl = h(
         'div',
         { class: 'pose' },
         ...[0, 1, 2].map((k) => {
-          const n = h('input', { class: 'in', type: 'number', step: 1, value: p[k] ?? 0, title: ['tilt x', 'turn y', 'roll z'][k] })
+          const n = h('input', { class: 'in', type: 'number', step: f.type === 'vec3' ? 0.1 : 1, value: p[k] ?? 0, title: (f.type === 'vec3' ? ['x: from the right', 'y: from above', 'z: from the camera'] : ['tilt x', 'turn y', 'roll z'])[k] })
           n.addEventListener('change', () => {
             const next = [...(getPath(theme(), f.path) ?? [0, 0, 0])]
             next[k] = Number(n.value)
@@ -969,6 +1284,7 @@ async function saveTheme() {
   save()
   renderThemes()
   renderPanel()
+  record('theme.save', `Saved the tweaks as theme “${r.id}” (${r.file})`, { theme: r.id, file: r.file })
   toast({ title: `Saved theme "${r.id}"`, sub: r.file, timeout: 5000 })
 }
 
@@ -1025,7 +1341,7 @@ function cliCommand() {
 
 function renderOutputPane() {
   const pane = $('#pane-output')
-  pane.replaceChildren(
+  fill(pane,
     h('div', { class: 'section-title' }, 'Where files go'),
     h('p', { class: 'note' }, 'Exports land in ', h('code', {}, boot.outDir), ' unless you set a folder below (relative to the project).'),
     h('div', { class: 'field' }, h('label', {}, 'Output folder'), input(state.export.out ?? '', (v) => ((state.export.out = v), save()), { placeholder: '.' }), h('span')),
@@ -1052,6 +1368,7 @@ async function saveConfig() {
   }
   const r = await fetch('/api/config', { method: 'POST', body: JSON.stringify({ config }) }).then((x) => x.json())
   if (r.error) return toast({ title: 'Could not save config', sub: r.error, error: true })
+  record('config.save', `Saved the project config to ${r.file}`, { file: r.file }, { undoable: false })
   toast({ title: 'Saved project config', sub: `${r.file} — render it with: cli.mjs --config ${r.file}`, timeout: 6000 })
 }
 
@@ -1066,7 +1383,7 @@ function renderExport() {
   const chosen = new Set(ex.sizes[state.category]?.length ? ex.sizes[state.category] : [sizeKey()])
   const formats = c.kind === 'video' ? ['mp4', 'hevc', 'mov', 'webm', 'gif'] : ['png', 'jpg', 'webp', 'avif']
   const fmt = ex.format[state.category] ?? formats[0]
-  pop.replaceChildren(
+  fill(pop,
     h('h3', {}, `Export ${c.name.toLowerCase()}`),
     h('div', { class: 'note' }, c.set ? `${slides().length} slides × each size` : c.kind === 'video' ? 'Rendered frame by frame, encoded by ffmpeg' : 'One image per size'),
     h(
@@ -1137,13 +1454,18 @@ async function startExport() {
     t.close()
     return toast({ title: 'Render failed to start', sub: error, error: true })
   }
+  record('export.start', `Export started: ${cat().name}, ${job.size}${job.format ? `, ${job.format}` : ''}`, { job: { category: job.category, theme: job.theme, size: job.size, format: job.format, transparent: job.transparent } }, { undoable: false })
   const poll = async () => {
     const s = await fetch(`/api/render/${id}`).then((r) => r.json())
     t.progress(s.fraction)
     t.sub(s.label)
     if (!s.done) return setTimeout(poll, 400)
     t.close()
-    if (s.error) return toast({ title: 'Render failed', sub: s.error, error: true })
+    if (s.error) {
+      record('export.fail', `Export failed: ${s.error}`, { error: s.error }, { undoable: false })
+      return toast({ title: 'Render failed', sub: s.error, error: true })
+    }
+    record('export.done', `Exported ${s.files.length} file${s.files.length === 1 ? '' : 's'}: ${s.files.map((f) => f.rel || f.path).join(', ')}`, { files: s.files.map((f) => f.path) }, { undoable: false })
     toast({
       title: `Done — ${s.files.length} file${s.files.length === 1 ? '' : 's'}`,
       sub: `${((Date.now() - s.started) / 1000).toFixed(1)}s`,
@@ -1151,6 +1473,242 @@ async function startExport() {
     })
   }
   poll()
+}
+
+/* ── tools: what a drag in the preview does ────────────────────────────── */
+
+const TOOLS = [
+  ['move', 'Move', 'V', 'Drag a device to move it · corner handles or the wheel resize · arrows nudge · drag a badge to place it'],
+  ['turn', 'Turn', 'T', 'Drag a device to tilt and turn it · Shift-drag rolls it'],
+  ['camera', 'Camera', 'K', 'Drag anywhere to orbit the camera · wheel moves it in and out · Shift-drag rolls'],
+  ['light', 'Light', 'L', 'Click or drag where the key light comes from'],
+]
+
+function renderTools() {
+  const bar = $('#tools')
+  const still = cat().kind === 'still'
+  fill(bar,
+    ...TOOLS.map(([id, name, keyName, tip]) => h('button', { class: `tool${state.tool === id ? ' on' : ''}`, title: `${name} (${keyName}) — ${tip}`, onclick: () => setTool(id) }, h('span', { html: ICON[id] }), name)),
+    h('span', { class: 'sep' }),
+    still && slides().length > 1
+      ? h(
+          'div',
+          { class: 'seg', title: 'Where a change made in the preview is kept' },
+          h('button', { class: state.scope === 'all' ? 'on' : '', onclick: () => setScope('all') }, 'All slides'),
+          h('button', { class: state.scope === 'slide' ? 'on' : '', onclick: () => setScope('slide') }, 'This slide'),
+        )
+      : null,
+    still && slides().length > 1 ? h('span', { class: 'sep' }) : null,
+    h('button', { class: 'tool icon', id: 'btn-undo', html: ICON.undo, onclick: undo }),
+    h('button', { class: 'tool icon', id: 'btn-redo', html: ICON.redo, onclick: redo }),
+  )
+  updateHistoryUi()
+  const tip = state.tool === 'pick' ? 'Click the part of the model that is its display · Esc to stop' : TOOLS.find(([id]) => id === state.tool)?.[3]
+  $('#hint').textContent = `${tip} · click text to edit it · drop screenshots, recordings or a .glb model anywhere`
+  document.body.dataset.tool = state.tool
+}
+
+function setTool(tool) {
+  state.tool = tool
+  renderTools()
+  frames.forEach(sendTool)
+}
+function setScope(scope) {
+  state.scope = scope
+  renderTools()
+  frames.forEach(sendTool)
+  record('scope', scope === 'slide' ? 'Preview edits now apply to the slide they are made on' : 'Preview edits now apply to every slide', { scope }, { undoable: false })
+}
+
+/* ── your own 3D model ─────────────────────────────────────────────────── */
+
+function pickModel() {
+  const input = h('input', { type: 'file', accept: '.glb,model/gltf-binary' })
+  input.onchange = () => input.files[0] && addModel(input.files[0])
+  input.click()
+}
+
+async function addModel(file) {
+  const t = toast({ title: `Reading ${file.name}…`, progress: 0.3 })
+  try {
+    const r = await fetch(`/api/model?name=${encodeURIComponent(file.name)}`, { method: 'POST', body: file })
+    const body = await r.json()
+    if (!r.ok) throw new Error(body.error)
+    ownDevices[body.id] = body.device
+    t.close()
+    // A model wants a 3D layout to stand in: move to the mockup category if this one is flat.
+    if (!cat().uses3d) state.category = 'device-mockup'
+    state.overridesByCat[state.category] = merge(overrides(), { device: { mode: '3d', model: body.id, finish: null } })
+    state.tab = 'style'
+    sessionStorage.setItem('open-groups', JSON.stringify(['Device']))
+    save()
+    renderAll()
+    setPanel(true)
+    const d = body.device
+    record('model.add', `Added own 3D model “${d.name}” (${body.id}) — screen ${d.screen ? JSON.stringify(d.screen) : 'not found yet'}`, { model: body.id, screen: d.screen, file: `.app-preview-craft/models/${body.id}.glb` })
+    if (!d.screen || !d.inspect.confident) {
+      setTool('pick')
+      toast({ title: d.screen ? `Is “${d.screen.material ?? d.screen.mesh}” the display?` : 'Which part is the display?', sub: 'Click the screen of the model in the preview. If it faces away or lies down, turn it with the Rotate buttons in the panel.', timeout: 9000 })
+    } else toast({ title: `${d.name} added`, sub: `Display: ${d.screen.material ?? d.screen.mesh}. Set it up under Style › Your model.`, timeout: 5000 })
+  } catch (err) {
+    t.close()
+    toast({ title: 'Could not add the model', sub: String(err.message ?? err), error: true })
+  }
+}
+
+async function updateModel(id, patch, text) {
+  const r = await fetch(`/api/model/${id}`, { method: 'POST', body: JSON.stringify(patch) }).then((x) => x.json())
+  if (r.error) return toast({ title: 'Could not save the model', sub: r.error, error: true })
+  ownDevices[id] = r.device
+  refreshAll({ delay: 0 })
+  renderStylePane()
+  record('model.update', `Model “${r.device.name}”: ${text}`, { model: id, ...patch }, { undoable: false })
+}
+
+function onPicked(msg) {
+  if (state.tool !== 'pick' || !ownDevices[msg.model]) return
+  const screen = msg.material ? { material: msg.material } : { mesh: msg.mesh }
+  setTool('move')
+  updateModel(msg.model, { screen }, `display is ${msg.material ? `material “${msg.material}”` : `mesh “${msg.mesh}”`}`)
+}
+
+function modelSetup(id) {
+  const d = ownDevices[id]
+  const rot = d.rotate ?? [0, 0, 0]
+  const mats = d.inspect.materials.filter((m) => m.meshes.length)
+  const screenValue = d.screen ? (d.screen.material != null ? `material:${d.screen.material}` : `mesh:${d.screen.mesh}`) : ''
+  const turn = (axis, by) => {
+    const next = [...rot]
+    next[axis] = (((next[axis] + by) % 360) + 360) % 360
+    updateModel(id, { rotate: next }, `rotated to ${next.join(', ')}°`)
+  }
+  const credit = d.credit ?? {}
+  const setCredit = (k) => (v) => updateModel(id, { credit: { ...credit, [k]: v || undefined } }, `credit ${k}: ${v || 'cleared'}`)
+  const toggleList = (key, name, on) => {
+    const cur = key === 'hide' ? (d.hide ?? []).map((x) => x.material) : (d.body ?? [])
+    const next = on ? [...new Set([...cur, name])] : cur.filter((x) => x !== name)
+    updateModel(id, { [key]: next }, `${key === 'hide' ? 'hidden parts' : 'body (finish) parts'}: ${next.join(', ') || 'none'}`)
+  }
+  return h(
+    'details',
+    { class: 'group model-setup', open: true },
+    h('summary', {}, `Your model · ${d.name}`, d.screen ? null : h('span', { class: 'count warn' }, 'no display set')),
+    h('p', { class: 'note' }, `Saved in .app-preview-craft/models/${id}.json — the CLI picks it up from there as --device ${id}.`),
+    h(
+      'div',
+      { class: 'field' },
+      h('label', { title: 'The part of the model that shows your screenshot' }, 'Display'),
+      h(
+        'div',
+        { class: 'ctl col' },
+        h(
+          'select',
+          {
+            class: 'in',
+            onchange: (e) => {
+              const [kind, ...rest] = e.target.value.split(':')
+              const name = rest.join(':')
+              updateModel(id, { screen: e.target.value ? { [kind]: name } : null }, e.target.value ? `display is ${kind} “${name}”` : 'display cleared')
+            },
+          },
+          h('option', { value: '', selected: !screenValue }, '— none —'),
+          ...mats.filter((m) => m.name).map((m) => h('option', { value: `material:${m.name}`, selected: screenValue === `material:${m.name}` }, `${m.name}${m.emissive ? ' · emissive' : ''}`)),
+          ...d.inspect.meshes.filter(Boolean).map((n) => h('option', { value: `mesh:${n}`, selected: screenValue === `mesh:${n}` }, `mesh: ${n}`)),
+        ),
+        h('button', { class: `btn small ${state.tool === 'pick' ? 'primary' : 'ghost'}`, onclick: () => setTool(state.tool === 'pick' ? 'move' : 'pick') }, h('span', { html: ICON.pick }), state.tool === 'pick' ? 'Picking… click the display' : 'Pick it in the preview'),
+        h('span', { class: 'dim', id: 'pick-hover' }, ''),
+      ),
+      h('span'),
+    ),
+    h(
+      'div',
+      { class: 'field' },
+      h('label', { title: 'Turns the raw model so its display faces you, top up' }, 'Rotate'),
+      h('div', { class: 'ctl col' }, h('div', { class: 'row' }, ...['X', 'Y', 'Z'].map((a, k) => h('button', { class: 'btn small ghost', title: `Turn 90° about ${a}`, onclick: () => turn(k, 90) }, `${a} +90°`))), h('span', { class: 'dim' }, `now ${rot.join(', ')}° — the display should face you, top up`)),
+      h('span'),
+    ),
+    h(
+      'div',
+      { class: 'field' },
+      h('label', { title: 'A phone is sized by its height, a laptop by its width' }, 'Kind'),
+      h('select', { class: 'in', onchange: (e) => updateModel(id, { kind: e.target.value === 'auto' ? null : e.target.value }, `kind: ${e.target.value}`) }, ...['auto', 'phone', 'laptop'].map((x) => h('option', { value: x, selected: (d.kind ?? 'auto') === x }, x === 'auto' ? 'auto — by its proportions' : x))),
+      h('span'),
+    ),
+    h(
+      'div',
+      { class: 'field' },
+      h('label', { title: 'Draw the iPhone Dynamic Island over the display' }, 'Dynamic Island'),
+      (() => {
+        const cb = h('input', { type: 'checkbox', checked: !!d.island })
+        cb.addEventListener('change', () => updateModel(id, { island: cb.checked }, `Dynamic Island ${cb.checked ? 'on' : 'off'}`))
+        return h('label', { class: 'toggle' }, cb, h('span'))
+      })(),
+      h('span'),
+    ),
+    h(
+      'details',
+      {},
+      h('summary', {}, `Parts (${mats.length} materials): body colour, cover glass`),
+      h('p', { class: 'note' }, '“Body” parts take the Body finish colour. Hide a cover glass that dims or tints the display.'),
+      h(
+        'div',
+        { class: 'parts' },
+        ...mats.filter((m) => m.name).map((m) => {
+          const body = h('input', { type: 'checkbox', checked: (d.body ?? []).includes(m.name) })
+          body.addEventListener('change', () => toggleList('body', m.name, body.checked))
+          const hide = h('input', { type: 'checkbox', checked: (d.hide ?? []).some((x) => x.material === m.name) })
+          hide.addEventListener('change', () => toggleList('hide', m.name, hide.checked))
+          return h('div', { class: 'part' }, h('span', { class: 't', title: m.meshes.join(', ') }, m.name), h('label', {}, body, 'body'), h('label', {}, hide, 'hide'))
+        }),
+      ),
+    ),
+    h(
+      'details',
+      { open: !credit.author },
+      h('summary', {}, 'Credit', credit.author ? null : h('span', { class: 'count warn' }, 'none on record')),
+      h('p', { class: 'note' }, 'Written to CREDITS.txt beside every export that shows this model. Most downloaded models (CC-BY) require it; your own work does not.'),
+      ...[['title', 'Title'], ['author', 'Author'], ['license', 'License'], ['source', 'Source URL']].map(([k, label]) => h('div', { class: 'field' }, h('label', {}, label), input(credit[k], setCredit(k), { placeholder: k === 'license' ? 'CC-BY-4.0' : '' }), h('span'))),
+    ),
+  )
+}
+
+/* ── history pane: the transcript, as the agent reads it ───────────────── */
+
+function renderHistoryPane() {
+  const pane = $('#pane-history')
+  const mine = new Set(history.slice(1, cursor + 1).map((x) => x.text))
+  const list = [...events].reverse()
+  fill(pane,
+    h('div', { class: 'section-title' }, 'History', h('span', { class: 'spacer' }), h('button', { class: 'btn small ghost', disabled: cursor === 0, onclick: undo }, h('span', { html: ICON.undo }), 'Undo'), h('button', { class: 'btn small ghost', disabled: cursor >= history.length - 1, onclick: redo }, h('span', { html: ICON.redo }), 'Redo')),
+    h('p', { class: 'note' }, 'Everything done here is written to ', h('code', {}, `${boot.transcript?.dir ?? '.app-preview-craft/studio'}/transcript.jsonl`), ', with the current setup beside it in ', h('code', {}, 'session.json'), '. Your coding agent reads both:'),
+    h('code', { class: 'cmd' }, 'node "$SKILL/scripts/cli.mjs" transcript'),
+    h(
+      'div',
+      { class: 'row', style: { marginTop: '8px' } },
+      h('button', { class: 'btn small ghost', onclick: () => navigator.clipboard.writeText(agentBrief()).then(() => toast({ title: 'Copied — paste it to your agent', timeout: 2500 })) }, 'Copy a brief for the agent'),
+    ),
+    h('div', { class: 'section-title' }, `Transcript (${events.length})`),
+    list.length ? null : h('p', { class: 'note' }, 'Nothing yet. Change a theme, drag the device, edit a headline — it shows up here.'),
+    h(
+      'ol',
+      { class: 'events' },
+      ...list.slice(0, 300).map((e) => h('li', { class: `${e.type?.split('.')[0] ?? ''}${mine.has(e.text) ? '' : ' past'}` }, h('time', {}, e.t ? new Date(e.t).toTimeString().slice(0, 5) : ''), h('span', {}, e.text ?? e.type))),
+    ),
+  )
+}
+
+function agentBrief() {
+  const s = sessionNow()
+  const changed = flatten(s.themeOverrides).map(([p, v]) => `  ${p} = ${v}`)
+  return [
+    `app-preview-craft studio session — ${cat().name}, theme ${s.theme}, size ${s.size}`,
+    changed.length ? `Changed from the theme:\n${changed.join('\n')}` : 'No theme overrides.',
+    `Render it: node "$SKILL/scripts/cli.mjs" --config ${boot.transcript?.dir ?? '.app-preview-craft/studio'}/session.json`,
+    `Full transcript: node "$SKILL/scripts/cli.mjs" transcript`,
+    '',
+    'Last steps:',
+    ...events.slice(-15).map((e) => `  - ${e.text ?? e.type}`),
+  ].join('\n')
 }
 
 /* ── toasts ────────────────────────────────────────────────────────────── */
@@ -1184,21 +1742,29 @@ function toast({ title, sub, progress, error, files, actions = [], timeout }) {
 
 /* ── keyboard ──────────────────────────────────────────────────────────── */
 
-window.addEventListener('keydown', (e) => {
-  if (e.target.closest('input, textarea, select, [contenteditable]')) return
+function onKey(e) {
+  if (e.target.closest?.('input, textarea, select, [contenteditable]')) return
+  const k = e.key.toLowerCase()
+  if ((e.metaKey || e.ctrlKey) && k === 'z') return (e.preventDefault(), e.shiftKey ? redo() : undo())
+  if ((e.metaKey || e.ctrlKey) && k === 'y') return (e.preventDefault(), redo())
+  if (e.metaKey || e.ctrlKey) return
   const ids = Object.keys(allThemes())
   const i = ids.indexOf(themeId())
-  if (e.key === 'ArrowRight' && !e.metaKey) setTheme(ids[(i + 1) % ids.length])
-  else if (e.key === 'ArrowLeft' && !e.metaKey) setTheme(ids[(i - 1 + ids.length) % ids.length])
+  const tool = { v: 'move', t: 'turn', k: 'camera', l: 'light' }[k]
+  if (tool) setTool(tool)
+  else if (e.key === 'ArrowRight') setTheme(ids[(i + 1) % ids.length])
+  else if (e.key === 'ArrowLeft') setTheme(ids[(i - 1 + ids.length) % ids.length])
   else if (e.key === ' ' && isVideo()) (e.preventDefault(), playing ? pause() : play())
-  else if (e.key.toLowerCase() === 'c') setPanel(!state.panel)
-  else if (e.key.toLowerCase() === 'e') $('#btn-export').click()
-  else if (e.key.toLowerCase() === 'r') $('#shuffle').click()
+  else if (k === 'c') setPanel(!state.panel)
+  else if (k === 'e') $('#btn-export').click()
+  else if (k === 'r') $('#shuffle').click()
   else if (e.key === 'Escape') {
     pop.hidden = true
-    if (state.focus != null) toggleFocus(state.focus)
+    if (state.tool === 'pick') setTool('move')
+    else if (state.focus != null) toggleFocus(state.focus)
   } else if (/^[1-5]$/.test(e.key)) setCategory(Object.keys(catalog.categories)[Number(e.key) - 1])
-})
+}
+window.addEventListener('keydown', onKey)
 
 let resizeTimer
 window.addEventListener('resize', () => {
@@ -1210,6 +1776,9 @@ window.addEventListener('resize', () => {
 document.body.classList.toggle('panel-open', state.panel)
 $('#btn-panel').classList.toggle('on', state.panel)
 renderAll()
+if (boot.lost?.length) {
+  toast({ title: `${boot.lost.length} screen${boot.lost.length > 1 ? 's are' : ' is'} no longer on disk`, sub: `${boot.lost.join(' · ')} — drop the file on its slide to put it back`, error: true })
+}
 if (boot.project?.missing?.length) {
   toast({ title: `${boot.project.missing.length} file(s) from the project config are missing`, sub: boot.project.missing.join(' · '), error: true })
 }

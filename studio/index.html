@@ -26,14 +26,16 @@
 </header>
 
 <main id="viewport">
+  <div id="tools" class="tools" role="toolbar" aria-label="Preview tools"></div>
   <div id="canvas" class="canvas"></div>
   <div id="transport" class="transport" hidden>
     <button class="icon-btn" id="play" title="Play / pause (Space)"><svg viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg></button>
-    <div class="scrub"><input type="range" id="scrub" min="0" max="1000" value="0"><div class="beats" id="beats"></div></div>
+    <div class="scrub"><input type="range" id="scrub" min="0" max="1000" value="0"><div class="beats" id="beats"></div><div class="keys" id="keys"></div></div>
     <span class="time" id="time">0.0s</span>
+    <div class="keybar" id="keybar" hidden></div>
   </div>
-  <div id="hint" class="hint">Drop screenshots or screen recordings anywhere · click text on the preview to edit it · drag a 3D device to turn it</div>
-  <div id="drop" class="drop" hidden><div><b>Drop to add slides</b><span>PNG, JPG, WebP · MP4, MOV, WebM</span></div></div>
+  <div id="hint" class="hint"></div>
+  <div id="drop" class="drop" hidden><div><b>Drop to add slides</b><span>PNG, JPG, WebP · MP4, MOV, WebM · or a .glb 3D model of your own</span></div></div>
 </main>
 
 <footer class="dock" id="dock">
@@ -51,12 +53,14 @@
     <button data-tab="slides" class="on">Slides</button>
     <button data-tab="style">Style</button>
     <button data-tab="output">Output</button>
+    <button data-tab="history">History</button>
     <span class="spacer"></span>
     <button class="icon-btn" id="panel-close" title="Close"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></svg></button>
   </div>
   <section class="panel-body" data-pane="slides" id="pane-slides"></section>
   <section class="panel-body" data-pane="style" id="pane-style" hidden></section>
   <section class="panel-body" data-pane="output" id="pane-output" hidden></section>
+  <section class="panel-body" data-pane="history" id="pane-history" hidden></section>
 </aside>
 
 <div class="popover" id="export-pop" hidden></div>
