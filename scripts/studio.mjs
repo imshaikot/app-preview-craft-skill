@@ -5,19 +5,21 @@
 //   node scripts/studio.mjs [--port 4747] [--out dir] [--no-open]
 import { spawn } from 'node:child_process'
 import { createHash, randomBytes } from 'node:crypto'
-import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
-import { basename, dirname, extname, join, relative, resolve } from 'node:path'
+import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { basename, dirname, extname, join, relative, resolve, sep } from 'node:path'
 import { CATEGORIES, SIZES } from '../stage/catalog/categories.js'
-import { DEVICES, FLAT_FRAMES } from '../stage/catalog/devices.js'
+import { DEVICES, FLAT_FRAMES, registerDevices } from '../stage/catalog/devices.js'
 import { FONTS } from '../stage/catalog/fonts.js'
 import { LAYOUTS } from '../stage/catalog/layouts.js'
 import { BASE } from '../stage/catalog/resolve.js'
 import { SCHEMA } from '../stage/catalog/schema.js'
 import { THEMES } from '../stage/themes/index.js'
 import { launchBrowser } from './browser.mjs'
+import { guessDevice, inspectModel, loadCustomDevices, modelId, saveDevice } from './custom-models.mjs'
 import { prepareScreen } from './images.mjs'
 import { buildJobs, findConfig, loadConfig, loadCustomThemes, renderJob, SAMPLE_BRAND, SAMPLE_SLIDES, SAMPLE_SLIDES_DESK, SAMPLE_SLIDES_TALL, TEMP_ROOT } from './render.mjs'
 import { sendFile, SKILL, startServer } from './server.mjs'
+import { appendEvents, readEvents, readSession, studioDir, writeSession } from './transcript.mjs'
 import { extractFrames, probe, VIDEO_EXT } from './video.mjs'
 
 const IMAGE_EXT = /\.(png|jpe?g|webp|avif|gif|heic)$/i
@@ -111,6 +113,14 @@ export async function startStudio({ port = 4747, out, open = true, config: confi
     Object.assign(custom, loaded)
     project.config.theme = Object.keys(loaded).at(-1)
   }
+  // The person's own 3D models: records on disk, plus a URL the browser can fetch each GLB by.
+  let devices = loadCustomDevices({ cwd, config: project ? { ...project.config, __dir: dirname(project.path) } : null })
+  const deviceForBrowser = (id) => {
+    const { path, ...def } = devices[id]
+    return { ...def, url: `${fileUrl(path)}?v=${Math.round(statSync(path).mtimeMs)}`, inspect: inspectModel(path) }
+  }
+  const devicesForBrowser = () => Object.fromEntries(Object.keys(devices).map((id) => [id, deviceForBrowser(id)]))
+
   let browser = null
   const renders = new Map()
   const prepared = new Map()
@@ -146,6 +156,8 @@ export async function startStudio({ port = 4747, out, open = true, config: confi
           },
           themes: THEMES,
           custom,
+          devices: devicesForBrowser(),
+          transcript: { dir: relative(cwd, studioDir(cwd)), events: readEvents(cwd).slice(-200), session: readSession(cwd) },
           samples: { slides: await sampleSlides(SAMPLE_SLIDES), tall: await sampleSlides(SAMPLE_SLIDES_TALL), desk: await sampleSlides(SAMPLE_SLIDES_DESK), brand: SAMPLE_BRAND },
           project,
         })
@@ -160,6 +172,74 @@ export async function startStudio({ port = 4747, out, open = true, config: confi
         if (existsSync(dst) && !readFileSync(dst).equals(buf)) dst = join(uploadDir, `${basename(name, extname(name))}-${randomBytes(2).toString('hex')}${extname(name)}`)
         writeFileSync(dst, buf)
         json(res, 200, await describe(dst))
+        return true
+      }
+      if (path === '/api/model' && req.method === 'POST') {
+        // A GLB of the person's own: kept in the project, with a record guessed from its materials.
+        const name = basename(url.searchParams.get('name') ?? 'model.glb')
+        if (!/\.glb$/i.test(name)) return json(res, 415, { error: `${extname(name) || 'that file'} is not a .glb — export or convert the model to binary glTF first` }), true
+        const id = modelId(name)
+        if (DEVICES[id]) return json(res, 409, { error: `"${id}" is the name of a built-in device; rename the file` }), true
+        const buf = await readBody(req)
+        const dir = join(cwd, '.app-preview-craft', 'models')
+        mkdirSync(dir, { recursive: true })
+        const dst = join(dir, `${id}.glb`)
+        writeFileSync(dst, buf)
+        let def
+        try {
+          def = { ...guessDevice(dst), file: `${id}.glb` }
+        } catch (err) {
+          rmSync(dst, { force: true })
+          throw err
+        }
+        // Keep what was set up before when the same model is dropped again.
+        const record = join(dir, `${id}.json`)
+        if (existsSync(record)) def = { ...def, ...JSON.parse(readFileSync(record, 'utf8')), file: `${id}.glb` }
+        saveDevice(cwd, id, def)
+        devices[id] = { ...def, path: dst }
+        json(res, 200, { id, device: deviceForBrowser(id) })
+        return true
+      }
+      const mm = path.match(/^\/api\/model\/([a-z0-9-]+)$/)
+      if (mm && req.method === 'POST') {
+        const id = mm[1]
+        if (!devices[id]) return json(res, 404, { error: 'no such model' }), true
+        const patch = JSON.parse(await readBody(req))
+        const allowed = ['name', 'kind', 'screen', 'rotate', 'hide', 'body', 'display', 'island', 'credit']
+        for (const k of Object.keys(patch)) if (!allowed.includes(k)) delete patch[k]
+        devices[id] = { ...devices[id], ...patch }
+        // null clears a setting; only `screen: null` means something (no display) and stays.
+        for (const [k, v] of Object.entries(devices[id])) if (v === null && k !== 'screen') delete devices[id][k]
+        const file = saveDevice(cwd, id, devices[id])
+        json(res, 200, { id, device: deviceForBrowser(id), file: relative(cwd, file) })
+        return true
+      }
+      if (path === '/api/transcript' && req.method === 'POST') {
+        const { events, session } = JSON.parse(await readBody(req))
+        const stamped = appendEvents(cwd, events)
+        if (session) writeSession(cwd, session)
+        json(res, 200, { events: stamped })
+        return true
+      }
+      if (path === '/api/transcript' && req.method === 'GET') {
+        json(res, 200, { events: readEvents(cwd), session: readSession(cwd) })
+        return true
+      }
+      if (path === '/api/restore' && req.method === 'POST') {
+        // /file URLs die with the process that made them, but the browser keeps its slides
+        // across restarts. Describe those files again — only ones this studio would have
+        // served anyway: its uploads, the samples, and what the project config names.
+        const { paths } = JSON.parse(await readBody(req))
+        const known = new Set(allowed.values())
+        const within = (p, dir) => p === dir || p.startsWith(dir + sep)
+        const files = {}
+        for (const raw of new Set(paths ?? [])) {
+          const p = resolve(String(raw))
+          if (!known.has(p) && !within(p, uploadDir) && !within(p, sampleDir)) files[raw] = { error: 'outside the project uploads' }
+          else if (!existsSync(p)) files[raw] = { error: 'missing' }
+          else files[raw] = await describe(p).catch((err) => ({ error: String(err?.message ?? err) }))
+        }
+        json(res, 200, { files })
         return true
       }
       if (path === '/api/prepare' && req.method === 'POST') {
@@ -188,6 +268,7 @@ export async function startStudio({ port = 4747, out, open = true, config: confi
             job.__dir = cwd
             const r = await renderJob(job, {
               custom: { ...custom, ...(body.custom ?? {}) },
+              devices,
               browser,
               server,
               log: (m) => (status.label = String(m).trim()),
@@ -265,10 +346,13 @@ export async function startStudio({ port = 4747, out, open = true, config: confi
   }
   if (!server) throw new Error(`no free port in ${port}..${port + 19}`)
   const link = `${server.origin}/studio/`
+  registerDevices(devices)
+  appendEvents(cwd, [{ type: 'session', text: `Studio opened at ${link}${project ? ` with ${relative(cwd, project.path)}` : ''}`, link, project: project ? relative(cwd, project.path) : null }])
   if (!quiet) {
     console.error(`\n  app-preview-craft studio  →  ${link}`)
     console.error(`  project: ${cwd}${project ? `  (config: ${relative(cwd, project.path)})` : ''}`)
-    console.error(`  exports: ${outDir}\n  Ctrl+C to stop.\n`)
+    console.error(`  exports: ${outDir}`)
+    console.error(`  transcript: ${relative(cwd, studioDir(cwd))}/  (cli.mjs transcript reads it back)\n  Ctrl+C to stop.\n`)
   }
   if (open) {
     const opener = process.platform === 'darwin' ? 'open' : process.platform === 'win32' ? 'start' : 'xdg-open'
