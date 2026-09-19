@@ -2,6 +2,7 @@
 // every animated property from t alone so frames can render in any order.
 import { bookends, captions, outroFade, paintBeat, screenState, standInFront, textBox, timeline } from './common.js'
 import { clamp, ease, lerp, span, wobble } from '../lib/ease.js'
+import { keyTrack } from '../lib/keys.js'
 
 const introLen = (ctx) => (ctx.theme.motion.intro ? 1.8 : 0)
 const outroLen = (ctx) => (ctx.theme.motion.outro ? 2.2 : 0)
@@ -257,9 +258,9 @@ export const MOTION = {
     const arc = theme.motion.arc ?? 50
     const tl = tlFor(ctx)
     const dev = await ctx.device({ mode: '3d' })
-    dev.place({ x: d.x * W, y: d.y * H, size: d.size * H, rx: d.pose[0], ry: d.pose[1], rz: d.pose[2] })
     return withBookends(ctx, tl, async (t, { fade }) => {
       const p = ease.inOutSine(clamp(t / tl.total))
+      dev.place({ x: d.x * W, y: d.y * H, size: d.size * H, rx: d.pose[0], ry: d.pose[1], rz: d.pose[2], scale: fade })
       ctx.three.setView({
         ...cam,
         yaw: (cam.yaw ?? 0) - arc / 2 + arc * p,
@@ -269,7 +270,6 @@ export const MOTION = {
         ty: d.y * H,
       })
       ctx.three.scene.environmentRotation.y = (theme.scene.envRotation ?? 0) + p * 1.6
-      dev.group.scale.setScalar(d.size * H * fade)
       await paintBeat(ctx, dev, tl, t)
     })
   },
@@ -347,6 +347,7 @@ export const MOTION = {
     const ids = (theme.devices ?? [d.model, d.model, d.model]).slice(0, 3)
     const devs = []
     for (const id of ids) devs.push(await ctx.device({ mode: '3d', model: id }))
+    for (const dev of devs) dev.edit = { path: 'device', turn: false }
     const order = [0, 2, 1] // side, side, center (center last so it sits in front)
     return withBookends(ctx, tl, async (t, { fade }) => {
       const fan = span(t, tl.intro + 1.3, 1.1, ease.inOutCubic)
@@ -377,7 +378,6 @@ export const MOTION = {
     const tl = tlFor(ctx)
     const laptop = await ctx.device({ mode: '3d', model: d.laptop ?? 'macbook-pro-16' })
     const phone = await ctx.device({ mode: '3d' })
-    const ph = { ...d, ...d.phone }
     // Composed on a 16:9 box; a narrower page widens the box past its edges
     // so the pair still fills the width.
     const bw = Math.min(W * 1.4, (H * 16) / 9)
@@ -395,7 +395,11 @@ export const MOTION = {
       return -1
     }
     const openAt = tl.intro ? tl.intro - 0.5 : 0.3
+    // Both stand on the floor; x is a fraction of the 16:9 box, not of the page.
+    laptop.edit = { path: 'device', moveY: false, unitX: bw }
+    phone.edit = { path: 'device.phone', moveY: false, unitX: bw }
     return withBookends(ctx, tl, async (t, { fade }) => {
+      const ph = { ...d, ...d.phone }
       const open = span(t, openAt, 1.8, ease.inOutCubic)
       const slide = span(t, openAt + 1.3, 1.2, ease.outCubic)
       const camP = span(t, 0, tl.total, ease.inOutSine)
@@ -421,6 +425,7 @@ export const MOTION = {
     const cam = theme.scene.camera
     const tl = tlFor(ctx)
     const dev = await ctx.device({ mode: '3d' })
+    dev.edit = { path: 'device', moveY: false }
     return withBookends(ctx, tl, async (t, { fade }) => {
       const p = ease.inOutSine(clamp(t / tl.total))
       const h = d.size * H
@@ -428,6 +433,28 @@ export const MOTION = {
       const lift = span(t, 0, 1.2, ease.outCubic)
       dev.place({ x: d.x * W, y: floorY - dev.standHeight(h) / 2 - 2 - (1 - lift) * H * 0.05, size: h, rx: 0, ry: d.pose[1] - 200 + 360 * p, rz: 0, scale: fade })
       ctx.three.setView({ ...cam, pitch: (cam.pitch ?? 6) + Math.sin(p * Math.PI) * 4, dist: lerp(1.05, 0.95, p) })
+      await paintBeat(ctx, dev, tl, t)
+    })
+  },
+
+  /**
+   * The user's own move: device and camera follow `motion.keys`, a list of
+   *   { at: 0..1, x, y, size, pose: [rx, ry, rz], cam: { yaw, pitch, dist }, ease }
+   * `at` is a fraction of the whole video, so keys keep their place when
+   * slides or recordings change its length. A value a key leaves out holds
+   * from the key before it. The studio writes these by posing the device at
+   * the playhead; they are as good typed by hand.
+   */
+  async keyframes(ctx) {
+    const { W, H, theme } = ctx
+    const tl = tlFor(ctx)
+    const dev = await ctx.device({ mode: '3d' })
+    dev.edit = { path: 'device', keyed: true }
+    return withBookends(ctx, tl, async (t, { fade }) => {
+      // Built per frame from the theme as it is now: a handful of keys, and the studio edits them live.
+      const k = keyTrack(theme.motion.keys, theme)(clamp(t / tl.total))
+      dev.place({ x: k.x * W, y: k.y * H, size: k.size * H, rx: k.rx, ry: k.ry, rz: k.rz, scale: fade })
+      ctx.three.setView({ ...theme.scene.camera, yaw: k.yaw, pitch: k.pitch, dist: k.dist, tx: lerp(W / 2, k.x * W, k.follow), ty: lerp(H / 2, k.y * H, k.follow) })
       await paintBeat(ctx, dev, tl, t)
     })
   },

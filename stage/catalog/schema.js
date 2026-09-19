@@ -2,7 +2,7 @@
 // inspector from this list, the CLI documents `--set` paths from it, and
 // resolve.js coerces string values (from flags) with it.
 //
-// type: color | number | range | select | text | bool | font | pose | list
+// type: color | number | range | select | text | bool | font | pose | vec3 | list
 import { FONTS } from './fonts.js'
 import { DEVICES, FLAT_FRAMES } from './devices.js'
 
@@ -62,6 +62,7 @@ export const SCHEMA = [
   { group: 'Device', path: 'device.size', type: 'range', min: 0.2, max: 1.6, step: 0.01, label: 'Size' },
   { group: 'Device', path: 'device.x', type: 'range', min: -0.5, max: 1.5, step: 0.005, label: 'X' },
   { group: 'Device', path: 'device.y', type: 'range', min: -0.5, max: 1.5, step: 0.005, label: 'Y' },
+  { group: 'Device', path: 'device.z', type: 'range', min: -0.6, max: 0.6, step: 0.005, label: 'Depth (toward camera)' },
   { group: 'Device', path: 'device.pose', type: 'pose', label: 'Rotation (x, y, z°)' },
   { group: 'Device', path: 'device.finish', type: 'color', nullable: true, label: 'Body finish' },
   { group: 'Device', path: 'device.glare', type: 'range', min: 0, max: 2, step: 0.05, label: 'Screen glare' },
@@ -89,12 +90,14 @@ export const SCHEMA = [
   { group: '3D scene', path: 'scene.ambient', type: 'range', min: 0, max: 3, step: 0.05, label: 'Ambient' },
   { group: '3D scene', path: 'scene.key.intensity', type: 'range', min: 0, max: 8, step: 0.1, label: 'Key light' },
   { group: '3D scene', path: 'scene.key.color', type: 'color', label: 'Key color' },
+  { group: '3D scene', path: 'scene.key.dir', type: 'vec3', label: 'Key direction (x, y, z)' },
   { group: '3D scene', path: 'scene.shadow.blur', type: 'range', min: 0, max: 60, step: 1, label: 'Shadow softness' },
   { group: '3D scene', path: 'scene.wall.depth', type: 'range', min: 0, max: 0.5, step: 0.005, label: 'Shadow distance' },
   { group: '3D scene', path: 'scene.floor.mirror', type: 'range', min: 0, max: 1, step: 0.01, label: 'Floor reflection' },
   { group: '3D scene', path: 'scene.camera.yaw', type: 'range', min: -90, max: 90, step: 1, label: 'Camera yaw' },
   { group: '3D scene', path: 'scene.camera.pitch', type: 'range', min: -60, max: 60, step: 1, label: 'Camera pitch' },
   { group: '3D scene', path: 'scene.camera.dist', type: 'range', min: 0.3, max: 3, step: 0.01, label: 'Camera distance' },
+  { group: '3D scene', path: 'scene.camera.roll', type: 'range', min: -45, max: 45, step: 0.5, label: 'Camera roll' },
 
   { group: 'Motion', path: 'motion.duration', type: 'range', min: 2, max: 60, step: 0.5, label: 'Duration (s)' },
   { group: 'Motion', path: 'motion.fps', type: 'select', options: [24, 25, 30, 50, 60], label: 'FPS' },
@@ -103,6 +106,7 @@ export const SCHEMA = [
   { group: 'Motion', path: 'motion.intro', type: 'bool', label: 'Intro title' },
   { group: 'Motion', path: 'motion.outro', type: 'bool', label: 'Outro card' },
   { group: 'Motion', path: 'motion.loop', type: 'bool', label: 'Seamless loop' },
+  { group: 'Motion', path: 'motion.keys', type: 'list', label: 'Keyframes (layout: keyframes)' },
 
   { group: 'Decor', path: 'decor', type: 'list', options: DECOR_KINDS, label: 'Decorations' },
 ]

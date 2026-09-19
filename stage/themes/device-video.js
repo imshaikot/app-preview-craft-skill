@@ -126,4 +126,17 @@ export default {
     decor: [{ kind: 'shapes', count: 4, shapes: ['knot', 'cube', 'ring', 'pill'], colors: ['#05d9e8', '#ff2a6d', '#ffffff'], size: 0.12, seed: 2 }],
     motion: { duration: 10, intro: true, outro: true },
   },
+
+  keyframes: {
+    id: 'keyframes',
+    name: 'Keyframes',
+    blurb: 'Your own choreography. Pose the device and camera at points along the timeline in the studio, or write motion.keys by hand.',
+    layout: 'keyframes',
+    palette: { bg: '#0b0d12', bg2: '#1b2030', bg3: '#2d3550', ink: '#ffffff', sub: 'rgba(255,255,255,0.68)', accent: '#c6ff3d', accent2: '#8b7bff' },
+    type: { display: 'space-grotesk', body: 'inter', weight: 650, tracking: -0.04, size: 1, highlight: 'color' },
+    background: { kind: 'radial', cx: 50, cy: 58, grain: 0.05, vignette: 0.35 },
+    device: { model: 'iphone-17-pro', y: 0.62, size: 0.64, glare: 0.7 },
+    scene: { env: 0.9, ambient: 0.25, rims: [{ color: '#8b7bff', intensity: 3, dir: [1, 0.3, -0.6] }], wall: { depth: 0.1, opacity: 0.3 } },
+    motion: { duration: 10 },
+  },
 }
