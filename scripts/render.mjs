@@ -12,7 +12,7 @@ import { homedir, tmpdir } from 'node:os'
 import { basename, dirname, extname, join, relative, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { CATEGORIES } from '../stage/catalog/categories.js'
-import { creditLine, DEVICES, FLAT_FRAMES } from '../stage/catalog/devices.js'
+import { creditLine, DEVICES, deviceDef, deviceIds, FLAT_FRAMES, registerDevices } from '../stage/catalog/devices.js'
 import { LAYOUTS } from '../stage/catalog/layouts.js'
 import { coerce, isObj, merge, resolveSize, resolveTheme, setPath } from '../stage/catalog/resolve.js'
 import { launchBrowser, openPage } from './browser.mjs'
@@ -140,7 +140,7 @@ function jobOverrides(job) {
   if (job.pose) put('device.pose', Array.isArray(job.pose) ? job.pose : coerce('device.pose', job.pose))
   if (job.device) {
     const [mode, variant] = String(job.device).split(':')
-    if (DEVICES[mode]) {
+    if (deviceDef(mode)) {
       put('device.mode', '3d')
       put('device.model', mode)
     } else if (['flat', 'frameless', 'none', '3d'].includes(mode)) {
@@ -149,7 +149,7 @@ function jobOverrides(job) {
     } else if (FLAT_FRAMES[mode]) {
       put('device.mode', 'flat')
       put('device.flat', mode)
-    } else throw new Error(`unknown device "${job.device}". Models: ${Object.keys(DEVICES).join(', ')}; or flat[:phone|phone-android|tablet|browser], frameless, none`)
+    } else throw new Error(`unknown device "${job.device}". Models: ${deviceIds().join(', ')}; or flat[:phone|phone-android|tablet|browser], frameless, none`)
   }
   put('screen.cleanStatusBar', job.cleanStatusBar)
   put('motion.duration', job.duration)
@@ -239,17 +239,19 @@ function outputPlan(job, category, theme, size, { index, total, ext, set }) {
   return join(outArg, `${base}-${size.key}${suffix}.${ext}`)
 }
 
-function writeCredits(dir, credits) {
-  if (!credits.length) return null
+function writeCredits(dir, credits, uncredited = []) {
+  if (!credits.length && !uncredited.length) return null
   mkdirSync(dir, { recursive: true })
   const file = join(dir, 'CREDITS.txt')
   const existing = existsSync(file) ? readFileSync(file, 'utf8').split('\n') : []
   const lines = new Set(existing.filter((l) => l.startsWith('- ')))
   for (const c of credits) lines.add(`- ${creditLine(c)}`)
+  // A model someone brought without a credit: say so, so the gap is visible.
+  for (const name of uncredited) lines.add(`- "${name}": your own model, no credit on record — add one here if its license asks for attribution`)
   writeFileSync(
     file,
     [
-      '3D device models used in these renders (CC-BY-4.0 — attribution required when you publish them):',
+      '3D device models used in these renders (CC-BY-4.0 unless a line says otherwise — attribution required when you publish them):',
       '',
       ...[...lines].sort(),
       '',
@@ -270,8 +272,11 @@ function writeCredits(dir, credits) {
  *   server    reuse an existing server (studio)
  *   log, onProgress(fraction, label)
  */
-export async function renderJob(job, { custom = {}, browser: sharedBrowser, server: sharedServer, log = console.error, onProgress = () => {}, signal } = {}) {
+export async function renderJob(job, { custom = {}, devices = {}, browser: sharedBrowser, server: sharedServer, log = console.error, onProgress = () => {}, signal } = {}) {
   const category = job.category
+  // Custom models join the catalog before the theme resolves, so --device and device.model can name them.
+  registerDevices(devices)
+  if (job.modelId) job = { ...job, device: job.device ?? job.modelId }
   const cat = CATEGORIES[category]
   if (!cat) throw new Error(`unknown category "${category}". Try: ${Object.keys(CATEGORIES).join(', ')}`)
   const themeId = typeof job.theme === 'string' ? job.theme : isObj(job.theme) ? (job.theme.extends ?? job.theme.id) : undefined
@@ -302,6 +307,7 @@ export async function renderJob(job, { custom = {}, browser: sharedBrowser, serv
   const files = []
   const warnings = []
   let credits = []
+  const uncredited = new Set()
   try {
     onProgress(0.02, 'preparing screens')
     const { slides, usingSamples } = await prepareSlides(job, theme, work, { fps, isVideo, log })
@@ -323,6 +329,13 @@ export async function renderJob(job, { custom = {}, browser: sharedBrowser, serv
     if (brand.icon && !/^(https?:|data:)/.test(brand.icon)) {
       const p = expand(brand.icon, job.__dir)
       if (existsSync(p)) brand.icon = work.url(basename(stageAsset(p, work.dir, 'brand-icon')))
+    }
+
+    // The stage fetches a custom GLB like any other asset: from this job's work dir.
+    const specDevices = {}
+    for (const [id, def] of Object.entries(devices)) {
+      const { path, ...rest } = def
+      specDevices[id] = { ...rest, url: work.url(basename(stageAsset(path, work.dir, `model-${id}`))) }
     }
 
     if (!browser) browser = await launchBrowser({ headless: !job.headful })
@@ -362,6 +375,7 @@ export async function renderJob(job, { custom = {}, browser: sharedBrowser, serv
         animated: isVideo,
         transparent,
         credits: [],
+        devices: specDevices,
         assetBase: `${server.origin}/`,
         screenScale: pixels > 6e6 ? 1.2 : 1,
       }
@@ -376,6 +390,7 @@ export async function renderJob(job, { custom = {}, browser: sharedBrowser, serv
         const info = await page.evaluate((s) => window.stage.load(s), spec)
         if (page.errors.length) throw page.errors[0]
         credits = mergeCredits(credits, info.credits)
+        for (const n of info.uncredited ?? []) uncredited.add(n)
         for (const w of info.warnings) {
           if (warnings.includes(w)) continue
           warnings.push(w)
@@ -477,8 +492,8 @@ export async function renderJob(job, { custom = {}, browser: sharedBrowser, serv
       }
     }
     const creditDirs = new Set(files.map((f) => (cat.set ? dirname(dirname(f)) : dirname(f))))
-    const creditFiles = [...creditDirs].map((d) => writeCredits(d, credits)).filter(Boolean)
-    if (creditFiles.length) log(`  ✓ ${creditFiles.map(shown).join(', ')}  (CC-BY attribution for the 3D models)`)
+    const creditFiles = [...creditDirs].map((d) => writeCredits(d, credits, [...uncredited])).filter(Boolean)
+    if (creditFiles.length) log(`  ✓ ${creditFiles.map(shown).join(', ')}  (${credits.length ? 'CC-BY attribution' : 'a note'} for the 3D models)`)
     onProgress(1, 'done')
     return { category, theme: theme.id, files, credits, creditFiles, warnings }
   } finally {
@@ -490,6 +505,7 @@ export async function renderJob(job, { custom = {}, browser: sharedBrowser, serv
 }
 
 function mergeCredits(a, b) {
-  const seen = new Set(a.map((c) => c.source))
-  return [...a, ...b.filter((c) => !seen.has(c.source) && seen.add(c.source))]
+  const key = (c) => c.source ?? `${c.title}|${c.author}`
+  const seen = new Set(a.map(key))
+  return [...a, ...b.filter((c) => !seen.has(key(c)) && seen.add(key(c)))]
 }
