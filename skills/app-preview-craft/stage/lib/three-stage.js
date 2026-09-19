@@ -6,18 +6,31 @@
 // coordinates and the DOM text around them lines up exactly.
 import * as THREE from 'three'
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js'
+import { DRACOLoader } from 'three/addons/loaders/DRACOLoader.js'
+import { KTX2Loader } from 'three/addons/loaders/KTX2Loader.js'
 import { MeshoptDecoder } from 'three/addons/libs/meshopt_decoder.module.js'
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js'
 import { Reflector } from 'three/addons/objects/Reflector.js'
 import { RoundedBoxGeometry } from 'three/addons/geometries/RoundedBoxGeometry.js'
-import { DEVICES } from '../catalog/devices.js'
+import { deviceDef } from '../catalog/devices.js'
 import { ScreenPainter } from './screen.js'
 import { deg } from './ease.js'
 
-const loader = new GLTFLoader().setMeshoptDecoder(MeshoptDecoder)
+// Geometry and texture decoders are WebAssembly. Meshopt unpacks the bundled
+// models; Draco and Basis (KTX2) are there for models people bring, which are
+// often exported that way. Both fetch their .wasm only when a file needs it.
+const LIBS = new URL('/vendor/three/examples/jsm/libs/', import.meta.url).href
+const draco = new DRACOLoader().setDecoderPath(`${LIBS}draco/gltf/`)
+const ktx2 = new KTX2Loader().setTranscoderPath(`${LIBS}basis/`)
+const loader = new GLTFLoader().setMeshoptDecoder(MeshoptDecoder).setDRACOLoader(draco).setKTX2Loader(ktx2)
 const models = new Map()
 export function loadModel(url) {
-  if (!models.has(url)) models.set(url, loader.loadAsync(url))
+  if (!models.has(url)) {
+    const p = loader.loadAsync(url)
+    // A failed load is not cached: the studio retries after the file is fixed.
+    p.catch(() => models.delete(url))
+    models.set(url, p)
+  }
   return models.get(url)
 }
 
@@ -86,6 +99,7 @@ export class Stage3D {
     renderer.shadowMap.type = THREE.VSMShadowMap
     renderer.setClearColor(0x000000, 0)
     this.renderer = renderer
+    ktx2.detectSupport(renderer)
 
     const scene = new THREE.Scene()
     const pmrem = new THREE.PMREMGenerator(renderer)
@@ -137,6 +151,7 @@ export class Stage3D {
     const { scene, W, H } = this
     const hemi = new THREE.HemisphereLight(0xffffff, 0x444444, look.ambient ?? 0.4)
     scene.add(hemi)
+    this.hemi = hemi
 
     const key = look.key ?? {}
     const light = new THREE.DirectionalLight(toColor(key.color ?? '#ffffff'), key.intensity ?? 2)
@@ -158,17 +173,43 @@ export class Stage3D {
     light.shadow.bias = -0.0004
     scene.add(light, light.target)
     this.key = light
+    this.addFillLights(look)
+  }
 
+  addFillLights(look) {
+    const { scene, W, H } = this
+    for (const l of this.fills ?? []) scene.remove(l)
+    this.fills = []
     for (const rim of look.rims ?? []) {
       const l = new THREE.DirectionalLight(toColor(rim.color), rim.intensity ?? 2)
       l.position.copy(new THREE.Vector3(...rim.dir).normalize().multiplyScalar(this.baseDist))
-      scene.add(l)
+      this.fills.push(l)
     }
     for (const p of look.points ?? []) {
       const l = new THREE.PointLight(toColor(p.color), p.intensity ?? 1, 0, 0)
       l.position.copy(this.world(p.x * W, p.y * H, (p.z ?? 0.3) * H))
-      scene.add(l)
+      this.fills.push(l)
     }
+    if (this.fills.length) scene.add(...this.fills)
+  }
+
+  /**
+   * Retune the look in place: everything addLights and the constructor read
+   * from `look`, without rebuilding the renderer. The floor, wall and fov
+   * change the scene's geometry and still need a fresh load.
+   */
+  setLook(look) {
+    this.look = look
+    this.renderer.toneMappingExposure = look.exposure ?? 1
+    this.scene.environmentIntensity = look.env ?? 1
+    this.scene.environmentRotation.y = look.envRotation ?? 0
+    this.hemi.intensity = look.ambient ?? 0.4
+    const key = look.key ?? {}
+    this.key.color = toColor(key.color ?? '#ffffff')
+    this.key.intensity = key.intensity ?? 2
+    this.key.position.copy(new THREE.Vector3(...(key.dir ?? [-0.5, 0.8, 1])).normalize().multiplyScalar(this.baseDist))
+    this.key.shadow.radius = look.shadow?.blur ?? 18
+    this.addFillLights(look)
   }
 
   /** A shadow-catching wall behind the devices, for flat front-facing layouts. */
@@ -251,9 +292,11 @@ export class Stage3D {
   }
 
   async addDevice(id, opts = {}) {
-    const def = DEVICES[id]
+    const def = deviceDef(id)
     if (!def) throw new Error(`unknown device "${id}"`)
-    const gltf = await loadModel(`${opts.modelBase ?? '/assets/models/'}${def.file}`)
+    const gltf = await loadModel(def.url ?? `${opts.modelBase ?? '/assets/models/'}${def.file}`).catch((err) => {
+      throw new Error(`${id}: could not load the model (${def.url ?? def.file}) — ${err?.message ?? err}`)
+    })
     const device = new Device3D(this, id, def, gltf, opts)
     this.scene.add(device.group)
     this.devices.push(device)
@@ -326,7 +369,9 @@ export class Device3D {
 
     const norm = new THREE.Group()
     norm.add(fix)
-    const unit = def.fit === 'width' ? size.x : size.y
+    // A model that does not say what it is goes by its shape: wider than tall is a laptop, sized by width.
+    this.kind = def.kind ?? (size.x > size.y * 1.2 ? 'laptop' : 'phone')
+    const unit = (def.fit ?? (this.kind === 'laptop' ? 'width' : 'height')) === 'width' ? size.x : size.y
     norm.scale.setScalar(1 / unit)
     this.dims = size.clone().divideScalar(unit) // normalized extents
 
@@ -339,45 +384,25 @@ export class Device3D {
     group.updateMatrixWorld(true)
 
     const hidden = def.hide ?? []
+    const want = def.screen
     const screens = []
+    this.bodyMeshes = []
     model.traverse((o) => {
       if (!o.isMesh) return
       o.castShadow = true
       o.receiveShadow = false
       const name = o.material?.name
-      if (hidden.some((h) => h.material === name)) o.visible = false
-      if (name === def.screen.material) screens.push(o)
-      if (finish && def.body?.includes(name)) {
+      o.userData.materialName = name ?? ''
+      if (hidden.some((h) => (h.material != null && h.material === name) || (h.mesh != null && h.mesh === o.name))) o.visible = false
+      if (want && ((want.material != null && want.material === name) || (want.mesh != null && (want.mesh === o.name || want.mesh === o.parent?.name)))) screens.push(o)
+      else if (def.body?.includes(name)) {
+        o.userData.baseColor = o.material.color.clone()
         o.material = o.material.clone()
-        o.material.color = toColor(finish)
+        this.bodyMeshes.push(o)
       }
     })
-    if (!screens.length) throw new Error(`${id}: no mesh uses screen material "${def.screen.material}"`)
-
-    // Screen texture: a canvas the painter draws into.
-    const [dw, dh] = def.display
-    const cap = 2400 * screenScale
-    const k = Math.min(1, cap / Math.max(dw, dh))
-    this.painter = new ScreenPainter(dw * k, dh * k, { background })
-    const tex = new THREE.CanvasTexture(this.painter.canvas)
-    tex.colorSpace = THREE.SRGBColorSpace
-    tex.anisotropy = stage.maxAnisotropy
-    tex.generateMipmaps = true
-    tex.minFilter = THREE.LinearMipmapLinearFilter
-    this.texture = tex
-    this.screenMaterial = new THREE.MeshPhysicalMaterial({
-      color: 0x000000,
-      emissive: 0xffffff,
-      emissiveMap: tex,
-      roughness: 0.06,
-      metalness: 0,
-      clearcoat: 1,
-      clearcoatRoughness: 0.04,
-      envMapIntensity: glare,
-      toneMapped: false,
-      // Some exports wind the display triangles inward; culling would hide them.
-      side: THREE.DoubleSide,
-    })
+    if (want && !screens.length) throw new Error(`${id}: no mesh uses screen ${want.material != null ? `material "${want.material}"` : `mesh "${want.mesh}"`}`)
+    this.setFinish(finish)
 
     // Planar UVs across the screen's projection on the normalized XY plane:
     // the source UVs differ per model and are rarely a clean 0..1 rectangle.
@@ -405,13 +430,41 @@ export class Device3D {
       })
       geo.setAttribute('uv', new THREE.BufferAttribute(uv, 2))
       mesh.geometry = geo
-      mesh.material = this.screenMaterial
       mesh.renderOrder = 1
     })
     this.screens = screens
     this.screenBox = b // normalized screen rect, for callouts that point at the display
 
-    if (def.island) this.buildIsland(def.island, b, inv)
+    // Screen texture: a canvas the painter draws into. A model that does not
+    // state its display takes the shape of its screen mesh.
+    const shape = screens.length ? (b.max.x - b.min.x) / (b.max.y - b.min.y) : 0.46
+    const [dw, dh] = def.display ?? (shape >= 1 ? [2400, 2400 / shape] : [2400 * shape, 2400])
+    this.display = [dw, dh]
+    const cap = 2400 * screenScale
+    const k = Math.min(1, cap / Math.max(dw, dh))
+    this.painter = new ScreenPainter(dw * k, dh * k, { background })
+    const tex = new THREE.CanvasTexture(this.painter.canvas)
+    tex.colorSpace = THREE.SRGBColorSpace
+    tex.anisotropy = stage.maxAnisotropy
+    tex.generateMipmaps = true
+    tex.minFilter = THREE.LinearMipmapLinearFilter
+    this.texture = tex
+    this.screenMaterial = new THREE.MeshPhysicalMaterial({
+      color: 0x000000,
+      emissive: 0xffffff,
+      emissiveMap: tex,
+      roughness: 0.06,
+      metalness: 0,
+      clearcoat: 1,
+      clearcoatRoughness: 0.04,
+      envMapIntensity: glare,
+      toneMapped: false,
+      // Some exports wind the display triangles inward; culling would hide them.
+      side: THREE.DoubleSide,
+    })
+    for (const mesh of screens) mesh.material = this.screenMaterial
+
+    if (def.island && screens.length) this.buildIsland(def.island, b, inv)
     if (def.lid) this.buildLid(def.lid)
   }
 
@@ -502,6 +555,39 @@ export class Device3D {
     this.lidClose = close
   }
 
+  /** Repaint the body materials; null puts the model's own colors back. */
+  setFinish(finish) {
+    for (const o of this.bodyMeshes) o.material.color.copy(finish ? toColor(finish) : o.userData.baseColor)
+  }
+
+  setGlare(glare) {
+    this.screenMaterial.envMapIntensity = glare
+  }
+
+  /** Page-pixel box around the placed device, for the studio's selection outline. */
+  pageRect() {
+    const { x, y, z } = this.dims
+    const cam = this.stage.camera
+    const v = new THREE.Vector3()
+    let x0 = Infinity
+    let y0 = Infinity
+    let x1 = -Infinity
+    let y1 = -Infinity
+    this.group.updateMatrixWorld(true)
+    for (const sx of [-0.5, 0.5])
+      for (const sy of [-0.5, 0.5])
+        for (const sz of [-0.5, 0.5]) {
+          v.set(sx * x, sy * y, sz * z).applyMatrix4(this.pivot.matrixWorld).project(cam)
+          const px = ((v.x + 1) / 2) * this.stage.W
+          const py = ((1 - v.y) / 2) * this.stage.H
+          x0 = Math.min(x0, px)
+          x1 = Math.max(x1, px)
+          y0 = Math.min(y0, py)
+          y1 = Math.max(y1, py)
+        }
+    return { x: x0, y: y0, w: x1 - x0, h: y1 - y0 }
+  }
+
   /** 1 = as modelled (open), 0 = shut. */
   setLid(open) {
     if (this.lidGroup) this.lidGroup.rotation.x = (1 - open) * this.lidClose
@@ -544,6 +630,7 @@ export class Device3D {
   }
 
   dispose() {
+    for (const o of this.bodyMeshes) o.material.dispose()
     this.texture.dispose()
     this.screenMaterial.dispose()
     this.island?.geometry.dispose()

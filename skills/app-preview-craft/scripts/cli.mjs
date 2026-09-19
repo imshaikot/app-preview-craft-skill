@@ -6,6 +6,8 @@
 //   node cli.mjs gallery <category> [--size s]      one thumbnail per theme
 //   node cli.mjs init [category]                     write app-preview-craft.json here
 //   node cli.mjs studio [--port 4747]                open the preview studio
+//   node cli.mjs transcript [--tail n] [--json]      what was done in the studio, and how to render it
+//   node cli.mjs inspect <model.glb>                 materials in a 3D model and its likely screen
 //   node cli.mjs doctor | models
 import { existsSync, writeFileSync } from 'node:fs'
 import { join, relative } from 'node:path'
@@ -15,6 +17,7 @@ import { FONTS } from '../stage/catalog/fonts.js'
 import { LAYOUTS } from '../stage/catalog/layouts.js'
 import { SCHEMA } from '../stage/catalog/schema.js'
 import { THEMES } from '../stage/themes/index.js'
+import { describeModel, inspectModel, loadCustomDevices } from './custom-models.mjs'
 import { buildJobs, findConfig, loadConfig, loadCustomThemes, renderJob, SAMPLE_SLIDES } from './render.mjs'
 
 const HELP = `app-preview-craft <category> [screens...] [options]
@@ -35,6 +38,11 @@ Look
   --layout <id>           any layout of the same kind (see: list layouts)
   --device <id>           ${Object.keys(DEVICES).join(' | ')}
                           | flat[:${Object.keys(FLAT_FRAMES).join('|')}] | frameless | none
+                          | the id of your own model (see: list devices)
+  --model <file.glb>      bring your own 3D device; it becomes --device (see: inspect <file.glb>)
+  --model-screen <name>   the material that is its display, or mesh:<name>   (default: guessed)
+  --model-rotate <x,y,z>  degrees that turn its screen to face the camera, top up
+  --model-kind <kind>     phone (sized by height) | laptop (sized by width); default: by its proportions
   --finish <#hex>         repaint the 3D device body
   --pose <rx,ry,rz>       device rotation in degrees
   --font <id> --body-font <id>
@@ -123,6 +131,7 @@ function cliJob(category, screens, o) {
     theme: o.theme,
     layout: o.layout,
     device: o.device,
+    modelId: o.modelId,
     finish: o.finish,
     pose: o.pose,
     font: o.font,
@@ -207,13 +216,22 @@ async function list(what = 'categories', o) {
       const keys = cat ? CATEGORIES[cat].sizes : Object.keys(SIZES)
       return table(keys.map((k) => [k, `${SIZES[k].w}×${SIZES[k].h}`, SIZES[k].label]), ['size', 'pixels', 'use']) + '\n\nAny WxH also works, e.g. --size 1500x1000'
     }
-    case 'devices':
+    case 'devices': {
+      const own = Object.entries(loadCustomDevices({ config: findConfig() ? loadConfig(findConfig()) : null }))
       return (
-        table(Object.entries(DEVICES).map(([k, d]) => [k, d.kind, d.name, `${d.credit.author} · ${d.credit.license}`]), ['device', 'kind', 'model', 'credit']) +
+        table(
+          [
+            ...Object.entries(DEVICES).map(([k, d]) => [k, d.kind, d.name, `${d.credit.author} · ${d.credit.license}`]),
+            ...own.map(([k, d]) => [k, d.kind ?? 'auto', d.name ?? k, d.credit?.author ? `${d.credit.author} · ${d.credit.license ?? 'license not stated'}` : `yours · ${relative(process.cwd(), d.path)}`]),
+          ],
+          ['device', 'kind', 'model', 'credit'],
+        ) +
+        (own.length ? '' : '\n\nBring your own: --model file.glb, or drop a .glb into ./.app-preview-craft/models/ (inspect <file.glb> shows its materials)') +
         '\n\n' +
         table(Object.entries(FLAT_FRAMES).map(([k, d]) => [`flat:${k}`, d.name]), ['css frame', '']) +
         '\n\nframeless · none'
       )
+    }
     case 'fonts':
       return table(Object.entries(FONTS).map(([k, f]) => [k, f.family, f.kind]), ['font', 'family', 'kind'])
     case 'layouts':
@@ -261,6 +279,15 @@ async function main() {
     console.log(await list(pos[1], opts))
     return
   }
+  if (cmd === 'inspect') {
+    if (!pos[1]) throw new Error('inspect needs a .glb file')
+    console.log(opts.json ? JSON.stringify(inspectModel(pos[1]), null, 2) : describeModel(pos[1]))
+    return
+  }
+  if (cmd === 'transcript') {
+    const { printTranscript } = await import('./transcript.mjs')
+    return printTranscript({ tail: opts.tail != null ? Number(opts.tail) : undefined, json: opts.json })
+  }
   if (cmd === 'doctor') return import('./doctor.mjs')
   if (cmd === 'models') return import('./models.mjs')
   if (cmd === 'studio') {
@@ -303,10 +330,13 @@ async function main() {
   }
   if (!jobs.length) throw new Error('no jobs to render')
   const custom = await loadCustomThemes(opts['theme-file'] ?? [])
+  const modelCli = { model: opts.model, modelScreen: opts['model-screen'], modelRotate: opts['model-rotate'], modelKind: opts['model-kind'] }
+  const devices = loadCustomDevices({ config, cli: modelCli })
+  if (modelCli.modelId) for (const j of jobs) j.modelId = modelCli.modelId
   const results = []
   for (const job of jobs) {
     if (!opts.json) console.error(`▸ ${job.category} · ${typeof job.theme === 'string' ? job.theme : (job.theme?.id ?? CATEGORIES[job.category]?.defaultTheme)} · ${job.size ?? CATEGORIES[job.category]?.defaultSize}`)
-    results.push(await renderJob(job, { custom, log: opts.json ? () => {} : console.error }))
+    results.push(await renderJob(job, { custom, devices, log: opts.json ? () => {} : console.error }))
   }
   if (opts.json) console.log(JSON.stringify(results, null, 2))
 }

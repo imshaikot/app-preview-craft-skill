@@ -118,6 +118,53 @@ export const DEVICES = {
   },
 }
 
+// Bring-your-own models. A custom device is the same record as above, written
+// as JSON next to its GLB (`.app-preview-craft/models/<id>.json`), in a project
+// config's `devices`, or made on the fly by `--model file.glb`:
+//
+//   { "name": "Pixel 9", "kind": "phone", "file": "pixel-9.glb",    kind: phone | laptop; left out,
+//                                                                 it follows the model's proportions
+//     "screen": { "material": "Screen" },        or { "mesh": "Display" }
+//     "rotate": [0, 180, 0],                      degrees; turns the screen to face +Z, +Y up
+//     "hide": [{ "material": "Glass" }], "body": ["Frame"],
+//     "display": [1080, 2424],                    optional: measured from the screen mesh
+//     "credit": { "title", "author", "authorUrl", "source", "license" } }
+//
+// They live apart from DEVICES so the built-in catalog stays a constant.
+export const CUSTOM_DEVICES = {}
+
+const rad = (d) => (d * Math.PI) / 180
+
+/** Fill in a custom device record. `file`/`url` are left as given. */
+export function normalizeDevice(id, def = {}) {
+  const screen = typeof def.screen === 'string' ? { material: def.screen } : (def.screen ?? null)
+  return {
+    ...def,
+    id,
+    custom: true,
+    name: def.name ?? id,
+    kind: def.kind === 'laptop' || def.kind === 'phone' ? def.kind : undefined,
+    fix: def.fix ?? (def.rotate ?? [0, 0, 0]).map(rad),
+    screen,
+    hide: (def.hide ?? []).map((h) => (typeof h === 'string' ? { material: h } : h)),
+    body: def.body ?? [],
+    fit: def.fit,
+    island: def.island === true ? ISLAND : def.island || undefined,
+    credit: def.credit?.author || def.credit?.title ? { title: def.name ?? id, license: 'not stated', ...def.credit } : null,
+  }
+}
+
+export function registerDevices(map = {}) {
+  for (const [id, def] of Object.entries(map ?? {})) {
+    if (DEVICES[id]) throw new Error(`custom model "${id}" has the name of a built-in device; rename it`)
+    CUSTOM_DEVICES[id] = normalizeDevice(id, def)
+  }
+  return CUSTOM_DEVICES
+}
+
+export const deviceDef = (id) => DEVICES[id] ?? CUSTOM_DEVICES[id]
+export const deviceIds = () => [...Object.keys(DEVICES), ...Object.keys(CUSTOM_DEVICES)]
+
 /** CSS-drawn frames for devices with no 3D model (and for flat themes). */
 export const FLAT_FRAMES = {
   phone: { name: 'Flat phone', radius: 0.14, bezel: 0.028, island: true, aspect: 1206 / 2622 },
@@ -127,5 +174,6 @@ export const FLAT_FRAMES = {
 }
 
 export function creditLine(c) {
-  return `"${c.title}" by ${c.author} (${c.authorUrl}), ${c.license} — ${c.source}`
+  const by = c.author ? ` by ${c.author}${c.authorUrl ? ` (${c.authorUrl})` : ''}` : ''
+  return `"${c.title}"${by}, ${c.license}${c.source ? ` — ${c.source}` : ''}`
 }
