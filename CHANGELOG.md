@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.2 — 2026-09-20
 
 - **The studio's preview is the editor.** Tools above it — Move, Turn, Camera, Light — make a
   drag in the preview move, resize or turn a device, orbit the camera or aim the key light;

@@ -1,7 +1,7 @@
 {
   "name": "app-preview-craft",
   "description": "Turn app screenshots and screen recordings into App Store and Play Store screenshots, social cards, 3D device mockups and promo videos, rendered locally with headless Chrome, three.js and ffmpeg.",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "author": {
     "name": "Shahriar",
     "url": "https://github.com/imshaikot"
