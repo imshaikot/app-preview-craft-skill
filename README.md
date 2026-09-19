@@ -20,12 +20,25 @@ rendered locally with headless Chrome, three.js and ffmpeg.
 | Agent | Install |
 | --- | --- |
 | **Claude Code** (plugin) | `claude plugin marketplace add imshaikot/app-preview-craft-skill`<br>`claude plugin install app-preview-craft@app-preview-craft` |
-| **Claude Code** (skill folder) | `git clone --depth 1 -b skill https://github.com/imshaikot/app-preview-craft-skill.git ~/.claude/skills/app-preview-craft` |
-| **Codex · Cursor · GitHub Copilot · Gemini CLI · OpenCode · Amp · Goose** | `git clone --depth 1 -b skill https://github.com/imshaikot/app-preview-craft-skill.git ~/.agents/skills/app-preview-craft` |
+| **Codex · Cursor · GitHub Copilot · Gemini CLI · OpenCode · Amp · Goose** | `npx skills add imshaikot/app-preview-craft-skill -g` |
 
 Inside Claude Code, run `/plugin marketplace add imshaikot/app-preview-craft-skill`, then
-`/plugin install app-preview-craft@app-preview-craft` as a separate command. For a single
-project, clone into `.claude/skills/` or `.agents/skills/` instead. Update a clone with
+`/plugin install app-preview-craft@app-preview-craft` as a separate command.
+
+[`npx skills`](https://github.com/vercel-labs/skills) finds the agents on your machine and
+installs for each of them, Claude Code included: one copy in `~/.agents/skills/`, linked into
+the folders of agents that read their own. Drop `-g` to install into the current project, add
+`-a codex` to pick one agent, and update with `npx skills update`.
+
+Without npx, clone the `skill` branch (its root is the skill) into a folder your agent reads:
+
+```bash
+git clone --depth 1 -b skill https://github.com/imshaikot/app-preview-craft-skill.git ~/.agents/skills/app-preview-craft
+```
+
+`~/.agents/skills/` serves Codex, Cursor, Copilot, Gemini CLI, OpenCode and Amp; Claude Code
+reads `~/.claude/skills/` and Goose `~/.config/goose/skills/`. For a single project use
+`.agents/skills/`, `.claude/skills/` or `.goose/skills/`. Update a clone with
 `git -C <dir> pull --ff-only`.
 
 **Requirements:** Node 20+, Chrome / Chromium / Edge with WebGL, and ffmpeg for video. On
@@ -39,7 +52,7 @@ packages (~95 MB) and checks the rest.
 | `app-store` | Screenshot sets at every App Store Connect / Play size | 10 |
 | `social-card` | Open Graph, X, LinkedIn, Instagram and story cards | 7 |
 | `screen-video` | 2D motion from screens and recordings, incl. App Store previews | 7 |
-| `device-video` | 3D iPhone, Galaxy and MacBook showcase videos | 9 |
+| `device-video` | 3D iPhone, Galaxy and MacBook showcase videos, or your own keyframed move | 10 |
 | `device-mockup` | 3D hero stills, optionally transparent | 7 |
 
 App Store themes borrow the look of popular apps in each store category (mood only, no brand
@@ -79,8 +92,20 @@ built-in, or an `app-preview-craft.json` project file
 ([example](skills/app-preview-craft/examples/app-preview-craft.json)). Files are written to
 the current directory.
 
-**Studio** — `node $SKILL/scripts/cli.mjs studio` opens a local, preview-first editor with
-drag-and-drop screens, inline copy editing, live 3D and one-click export.
+**Your own 3D model** — any `.glb` works as the device: `--model phone.glb` (the display is
+found from the material names; `cli.mjs inspect phone.glb` lists them). Draco and
+meshopt compressed files load through WebAssembly decoders. Credit for a downloaded model goes in its
+record and into `CREDITS.txt`.
+
+**Studio** — `node $SKILL/scripts/cli.mjs studio` opens a local editor where the preview is
+the canvas: drag a device to move, turn or resize it, orbit the camera, aim the key light,
+place badges, edit copy in place, set keyframes on the timeline, drop in your own `.glb`.
+Lights, camera and pose change on the live three.js scene in about a millisecond and match
+the export pixel for pixel. Undo and redo cover everything.
+
+Everything done in the studio is written to `.app-preview-craft/studio/` as a transcript, so
+the agent that opened it can read what you changed (`cli.mjs transcript`) and render exactly
+what you were looking at (`--config .app-preview-craft/studio/session.json`).
 
 ![Studio](previews/studio.png)
 

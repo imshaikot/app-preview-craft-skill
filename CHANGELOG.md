@@ -1,5 +1,37 @@
 # Changelog
 
+## Unreleased
+
+- **The studio's preview is the editor.** Tools above it — Move, Turn, Camera, Light — make a
+  drag in the preview move, resize or turn a device, orbit the camera or aim the key light;
+  badges and other decor drag too, arrows nudge, and on stills a drag can apply to every
+  slide or only the one it was made on. Undo and redo cover every change.
+- **Live edits without a rebuild.** `stage.patch()` retunes a loaded scene in place — lights,
+  camera, pose, position, size, finish, glare — in about 1 ms where a reload took ~200 ms per
+  frame, and draws the same pixels a fresh load would (the selftest compares them). Anything
+  that builds DOM or geometry still reloads. Still layouts now place their devices in
+  `update`, which is what makes that exact.
+- **Bring your own 3D model.** `--model file.glb` (with `--model-screen`, `--model-rotate`,
+  `--model-kind`), records in `.app-preview-craft/models/` or a config's `devices`, and
+  `cli.mjs inspect file.glb` to see a model's materials and the guessed display. The studio
+  takes a dropped `.glb`, and asks for a click on the display when the names give nothing to
+  go on. Draco and meshopt files decode through WebAssembly, loaded only when needed (the KTX2
+  transcoder is wired the same way).
+  A custom model's credit — or a note that none is on record — goes into `CREDITS.txt`.
+- **Keyframes.** New `keyframes` layout and device-video theme: the device and camera follow
+  `motion.keys`. In the studio the keys sit on the scrubber, and posing the device at the
+  playhead sets one. Pure functions of t, like every other layout; no animation library.
+- **A transcript the agent can read.** The studio writes each step to
+  `.app-preview-craft/studio/transcript.jsonl` and its current setup to `session.json`, a
+  project config. `cli.mjs transcript` prints both; `--config …/session.json` renders it.
+- Studio: screens you added survive a restart. Their `/file` URLs belonged to the server
+  process that made them, so reopening the studio showed "image failed to load" for every
+  upload, and recordings lost their frames; the studio now has them described again on load.
+- New `--set` paths: `device.z`, `scene.key.dir`, `scene.camera.roll`, `motion.keys`.
+- Install with `npx skills add imshaikot/app-preview-craft-skill -g`, which sets the skill up
+  for every agent it finds; cloning the `skill` branch still works. The install-folder lookup
+  in `SKILL.md` also searches Goose's folders (`.goose/skills`, `~/.config/goose/skills`).
+
 ## 0.2.1 — 2026-09-19
 
 - The **MacBook lid opens on its hinge**. The hinge was given in normalized units but applied
