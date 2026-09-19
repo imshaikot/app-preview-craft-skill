@@ -196,6 +196,16 @@ export const LAYOUTS = {
       scene: { floor: { y: 0.88, mirror: 0.4, opacity: 0.4 }, wall: null, key: { dir: [-0.2, 1, 0.45] }, camera: { pitch: 6 } },
     },
   },
+  keyframes: {
+    kind: 'video',
+    label: 'Your own move: device and camera follow motion.keys',
+    needs3d: true,
+    defaults: { text: { position: 'top' }, device: { mode: '3d', y: 0.62, size: 0.64 }, motion: { keys: null } },
+  },
 }
+
+// Layouts that size or arrange their devices while building, not in update:
+// a change to device.size / x / y there needs a fresh load (see stage.patch).
+export const STATIC_PLACE = new Set(['carousel', 'stack', 'zoom-tour', 'wall', 'grid-reveal', 'bento'])
 
 export const layoutsFor = (kind) => Object.entries(LAYOUTS).filter(([, l]) => l.kind === kind).map(([id]) => id)

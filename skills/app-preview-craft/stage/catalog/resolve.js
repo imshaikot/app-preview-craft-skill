@@ -134,7 +134,7 @@ export function coerce(path, raw) {
   const field = SCHEMA_BY_PATH[path]
   const s = raw.trim()
   if (s === 'null' || s === 'none' && field?.nullable) return null
-  if (field?.type === 'pose') return s.split(/[ ,]+/).map(Number)
+  if (field?.type === 'pose' || field?.type === 'vec3') return s.split(/[ ,]+/).map(Number)
   if (field?.type === 'number' || field?.type === 'range') return Number(s)
   if (field?.type === 'bool') return /^(1|true|yes|on)$/i.test(s)
   if (/^(true|false)$/.test(s)) return s === 'true'
