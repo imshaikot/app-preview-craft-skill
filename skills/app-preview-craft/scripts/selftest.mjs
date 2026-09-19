@@ -337,6 +337,43 @@ try {
     }
   })
 
+  await check('trio: the three devices never pass through each other', async () => {
+    const [W, H] = [360, 640]
+    const page = await openPage(browser, { width: W, height: H })
+    try {
+      await page.goto(`${server.origin}/stage/stage.html`, { waitUntil: 'load' })
+      await page.waitForFunction('window.stageReady === true')
+      const theme = setPath(resolveTheme('device-video', 'trio'), 'text.position', 'none')
+      const spec = { category: 'device-video', kind: 'video', theme, width: W, height: H, index: 0, count: 1, brand: {}, pixelRatio: 1, animated: true, assetBase: `${server.origin}/`, slides: [{ screen: { url: '/assets/samples/tempo-01.png', w: 1206, h: 2622 } }] }
+      const info = await page.evaluate((s) => window.stage.load(s), spec)
+      // Each device as an oriented box: center, three half-axes.
+      const boxes = (t) =>
+        page.evaluate(async (time) => {
+          await window.stage.seek(time)
+          return window.stage.three.devices.map((d) => {
+            d.group.updateMatrixWorld(true)
+            const e = d.pivot.matrixWorld.elements
+            const half = [d.dims.x / 2, d.dims.y / 2, d.dims.z / 2]
+            return { c: [e[12], e[13], e[14]], axes: [0, 1, 2].map((i) => [e[i * 4] * half[i], e[i * 4 + 1] * half[i], e[i * 4 + 2] * half[i]]) }
+          })
+        }, t)
+      const dot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+      const cross = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
+      const apart = (a, b) => {
+        const d = [0, 1, 2].map((i) => b.c[i] - a.c[i])
+        const tests = [...a.axes, ...b.axes, ...a.axes.flatMap((u) => b.axes.map((v) => cross(u, v)))]
+        return tests.some((L) => dot(L, L) > 1e-9 && Math.abs(dot(d, L)) > [...a.axes, ...b.axes].reduce((s, u) => s + Math.abs(dot(u, L)), 0))
+      }
+      for (let t = 0; t <= info.duration - 0.5; t += 0.1) {
+        const b = await boxes(t)
+        assert(b.length === 3, `${b.length} devices on the stage`)
+        for (const [i, j] of [[0, 1], [1, 2], [0, 2]]) assert(apart(b[i], b[j]), `devices ${i} and ${j} intersect at t=${t.toFixed(1)}s`)
+      }
+    } finally {
+      await page.close()
+    }
+  })
+
   if (!quick) {
     for (const [c, list] of Object.entries(THEMES)) {
       await check(`every ${c} theme renders without page errors`, async () => {
