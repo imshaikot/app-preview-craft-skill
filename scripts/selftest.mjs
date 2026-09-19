@@ -4,7 +4,7 @@
 //
 //   node scripts/selftest.mjs [--quick] [--only <substring>]
 import { spawnSync } from 'node:child_process'
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import sharp from 'sharp'
@@ -12,12 +12,14 @@ import { CATEGORIES, SIZES } from '../stage/catalog/categories.js'
 import { DEVICES } from '../stage/catalog/devices.js'
 import { FONTS } from '../stage/catalog/fonts.js'
 import { LAYOUTS } from '../stage/catalog/layouts.js'
-import { coerce, resolveTheme } from '../stage/catalog/resolve.js'
+import { coerce, resolveTheme, setPath } from '../stage/catalog/resolve.js'
 import { THEMES } from '../stage/themes/index.js'
 import { markup } from '../stage/lib/text.js'
-import { launchBrowser } from './browser.mjs'
+import { launchBrowser, openPage } from './browser.mjs'
+import { inspectModel, loadCustomDevices } from './custom-models.mjs'
 import { buildJobs, loadCustomThemes, renderJob } from './render.mjs'
 import { SKILL, startServer } from './server.mjs'
+import { readEvents, readSession } from './transcript.mjs'
 import { hasFfmpeg, probe } from './video.mjs'
 
 const args = process.argv.slice(2)
@@ -124,6 +126,13 @@ await check('--set values are coerced by the schema', () => {
   assert(coerce('background.panorama', 'yes') === true, 'bool')
   assert(coerce('device.finish', 'null') === null, 'null')
   assert(Array.isArray(coerce('decor', '[{"kind":"sparkles"}]')), 'json')
+})
+await check('inspecting a GLB finds its screen material and the credit it carries', () => {
+  const phone = inspectModel(join(SKILL, 'assets', 'models', 'galaxy-s21-ultra.glb'))
+  assert(phone.guess?.material === 'Screen' && phone.confident, `guessed ${JSON.stringify(phone.guess)}`)
+  assert(phone.credit?.author === 'DatSketch' && phone.credit.license === 'CC-BY-4.0', JSON.stringify(phone.credit))
+  // Hashed material names give nothing to go on: the guess must say it is unsure.
+  assert(!inspectModel(join(SKILL, 'assets', 'models', 'macbook-pro-16.glb')).confident, 'a guess from hashed names claimed confidence')
 })
 await check('*highlight* markup keeps trailing punctuation with its word', () => {
   const html = markup('Train *smarter*, not longer')
@@ -255,6 +264,79 @@ try {
     assert(m.width === 2064 && m.height === 2752, `${m.width}×${m.height}`)
   })
 
+  await check('your own GLB renders with its screen, and its credit (or the lack of one) is written down', async () => {
+    const dir = join(ROOT, 'own-model')
+    mkdirSync(dir, { recursive: true })
+    const glb = join(dir, 'my-phone.glb')
+    copyFileSync(join(SKILL, 'assets', 'models', 'galaxy-s21-ultra.glb'), glb)
+    // --model: the screen is guessed, the display shape measured, the credit read from the file.
+    const cli = { model: glb, modelRotate: '0,180,0' }
+    const devices = loadCustomDevices({ cwd: dir, cli })
+    const [job] = buildJobs({ cli: { category: 'device-mockup', theme: 'studio', size: '600x800', quiet: true, out: join(dir, 'a'), modelId: cli.modelId, set: [['device.pose', '0,0,0']] } })
+    const r = await renderJob(job, { browser, server, log: () => {}, devices })
+    const sd = await detail(r.files[0], [0.4, 0.4, 0.2, 0.2])
+    assert(sd > 12, `own model shows no screenshot (σ=${sd.toFixed(1)})`)
+    assert(readFileSync(r.creditFiles[0], 'utf8').includes('DatSketch'), 'the credit inside the GLB was not written')
+    // A record in the project config, with no credit: the note says so instead of staying silent.
+    const config = { __dir: dir, devices: { 'bare-phone': { file: 'my-phone.glb', screen: { material: 'Screen' }, rotate: [0, 180, 0] } } }
+    const [job2] = buildJobs({ cli: { category: 'device-mockup', theme: 'studio', size: '300x400', quiet: true, out: join(dir, 'b'), device: 'bare-phone' } })
+    const r2 = await renderJob(job2, { browser, server, log: () => {}, devices: loadCustomDevices({ cwd: join(dir, 'nowhere'), config }) })
+    assert(/bare-phone.*no credit on record/.test(readFileSync(r2.creditFiles[0], 'utf8')), 'an uncredited model left no note in CREDITS.txt')
+  })
+
+  await check('a patched stage draws the same pixels as a fresh load, and refuses what it cannot take live', async () => {
+    const [W, H] = [600, 800]
+    const page = await openPage(browser, { width: W, height: H })
+    try {
+      await page.goto(`${server.origin}/stage/stage.html`, { waitUntil: 'load' })
+      await page.waitForFunction('window.stageReady === true')
+      const spec = (theme) => ({ category: 'device-mockup', kind: 'still', theme, width: W, height: H, index: 0, count: 1, brand: {}, pixelRatio: 1, animated: false, assetBase: `${server.origin}/`, slides: [{ screen: { url: '/assets/samples/tempo-01.png', w: 1206, h: 2622 }, title: 'Patch *me*' }] })
+      const a = resolveTheme('device-mockup', 'levitate')
+      let b = a
+      for (const [path, v] of [['device.pose', [8, -28, 5]], ['device.x', 0.56], ['device.y', 0.6], ['device.size', 0.6], ['scene.exposure', 1.25], ['scene.key.dir', [0.9, 0.7, 1]], ['scene.camera.yaw', 12], ['device.finish', '#b5462f'], ['device.glare', 1.1]]) b = setPath(b, path, v)
+      await page.evaluate((s) => window.stage.load(s), spec(a))
+      const r = await page.evaluate((t) => window.stage.patch(t), b)
+      assert(r.exact, `patch fell back: ${r.rebuilds}`)
+      const patched = await sharp(await page.screenshot({ type: 'png' })).raw().toBuffer()
+      await page.evaluate((s) => window.stage.load(s), spec(b))
+      const loaded = await sharp(await page.screenshot({ type: 'png' })).raw().toBuffer()
+      let off = 0
+      for (let i = 0; i < loaded.length; i++) if (Math.abs(loaded[i] - patched[i]) > 3) off++
+      assert(off / loaded.length < 0.0005, `${off} of ${loaded.length} values differ between a patch and a load of the same theme`)
+      const no = await page.evaluate((t) => window.stage.patch(t), setPath(b, 'palette.bg', '#ff0000'))
+      assert(!no.exact && no.rebuilds.includes('palette.bg'), 'a palette change was taken as live')
+      assert(!page.errors.length, String(page.errors[0]))
+    } finally {
+      await page.close()
+    }
+  })
+
+  await check('keyframes: a frame depends on t alone, and motion.keys move the device', async () => {
+    const [W, H] = [360, 640]
+    const page = await openPage(browser, { width: W, height: H })
+    try {
+      await page.goto(`${server.origin}/stage/stage.html`, { waitUntil: 'load' })
+      await page.waitForFunction('window.stageReady === true')
+      const keys = [{ at: 0, x: 0.3, pose: [0, -30, 0] }, { at: 1, x: 0.7, pose: [0, 30, 0], cam: { dist: 0.9 }, ease: 'linear' }]
+      const theme = setPath(setPath(resolveTheme('device-video', 'keyframes'), 'motion.keys', keys), 'text.position', 'none')
+      const spec = { category: 'device-video', kind: 'video', theme, width: W, height: H, index: 0, count: 1, brand: {}, pixelRatio: 1, animated: true, assetBase: `${server.origin}/`, slides: [{ screen: { url: '/assets/samples/tempo-01.png', w: 1206, h: 2622 } }] }
+      const info = await page.evaluate((s) => window.stage.load(s), spec)
+      const shot = async (t) => {
+        await page.evaluate((x) => window.stage.seek(x), t)
+        return sharp(await page.screenshot({ type: 'png' })).raw().toBuffer()
+      }
+      const first = await shot(info.duration * 0.25)
+      await shot(info.duration * 0.9)
+      const again = await shot(info.duration * 0.25)
+      assert(first.equals(again), 'the same t drew a different frame after seeking elsewhere')
+      const x = (t) => page.evaluate((time) => window.stage.seek(time).then(() => window.stage.three.devices[0].group.position.x), t)
+      const [x0, x1] = [await x(0), await x(info.duration)]
+      assert(Math.abs(x0 - -0.2 * W) < 1 && Math.abs(x1 - 0.2 * W) < 1, `device x went ${x0.toFixed(1)} → ${x1.toFixed(1)}, expected ${-0.2 * W} → ${0.2 * W}`)
+    } finally {
+      await page.close()
+    }
+  })
+
   if (!quick) {
     for (const [c, list] of Object.entries(THEMES)) {
       await check(`every ${c} theme renders without page errors`, async () => {
@@ -270,7 +352,7 @@ try {
 
   /* ── studio ────────────────────────────────────────────────────────── */
 
-  await check('studio loads, previews every slide and switches category without errors', async () => {
+  await check('studio: previews load, a drag becomes an override, a transcript line and an undo step', async () => {
     const { startStudio } = await import('./studio.mjs')
     // An empty project dir, so a config in the caller's cwd cannot change the slide count.
     const cwd = process.cwd()
@@ -283,7 +365,8 @@ try {
       await page.setViewport({ width: 1440, height: 900 })
       const errors = []
       page.on('pageerror', (e) => errors.push(String(e)))
-      await page.evaluateOnNewDocument(() => localStorage.clear())
+      // Top frame only: the previews are same-origin iframes, and undo rebuilds them.
+      await page.evaluateOnNewDocument(() => window.top === window && localStorage.clear())
       await page.goto(link, { waitUntil: 'load' })
       const settled = (n) =>
         page.waitForFunction((count) => {
@@ -293,10 +376,84 @@ try {
       await settled(5)
       const failures = await page.$$eval('.frame .error', (els) => els.map((e) => e.textContent.slice(0, 200)))
       assert(!failures.length, `preview errors: ${failures.join(' | ')}`)
+      // Drag the device on slide 2: it moves there and then, the other frames follow,
+      // and the move is an override, a line in the transcript and one undo step.
+      const at = await page.$eval('.frame[data-index="1"] iframe', (el) => {
+        const r = el.getBoundingClientRect()
+        const st = el.contentWindow.stage
+        const b = st.three.devices[0].pageRect()
+        const k = r.width / st.ctx.W
+        return { x: r.x + (b.x + b.w / 2) * k, y: r.y + (b.y + b.h / 2) * k }
+      })
+      const deviceX = (i) => page.$eval(`.frame[data-index="${i}"] iframe`, (el) => el.contentWindow.stage.three.devices[0].group.position.x)
+      const before = await deviceX(1)
+      await page.mouse.move(at.x, at.y)
+      await page.mouse.down()
+      await page.mouse.move(at.x + 24, at.y, { steps: 4 })
+      const during = await deviceX(1)
+      await page.mouse.up()
+      assert(during > before + 20, `the device did not follow the drag (${before.toFixed(0)} → ${during.toFixed(0)})`)
+      await page.waitForFunction((want) => Math.abs(document.querySelector('.frame[data-index="3"] iframe').contentWindow.stage.three.devices[0].group.position.x - want) < 1, { timeout: 20_000 }, during)
+      const stored = () => page.evaluate(() => JSON.parse(localStorage.getItem(Object.keys(localStorage)[0])).overridesByCat['app-store'])
+      await page.waitForFunction(() => Object.keys(localStorage).length > 0, { timeout: 5000 })
+      assert((await stored())?.device?.x > 0.5, `no device.x override after the drag: ${JSON.stringify(await stored())}`)
+      await page.waitForFunction(() => fetch('/api/transcript').then((r) => r.json()).then((t) => t.events.some((e) => e.type === 'preview.edit')), { timeout: 10_000 })
+      const moved = readEvents(dir).find((e) => e.type === 'preview.edit')
+      assert(/^Moved .* device\.x = /.test(moved.text) && moved.changes[0].path === 'device.x', `transcript line: ${moved?.text}`)
+      assert(readSession(dir).themeOverrides.device.x === (await stored()).device.x, 'session.json does not hold the override')
+      await page.keyboard.down('Control')
+      await page.keyboard.press('z')
+      await page.keyboard.up('Control')
+      await page.waitForFunction(() => !JSON.parse(localStorage.getItem(Object.keys(localStorage)[0])).overridesByCat['app-store']?.device, { timeout: 5000 })
+      await settled(5)
+      assert(Math.abs((await deviceX(1)) - before) < 1, 'undo did not put the device back')
+
       await page.keyboard.press('4') // device-video
       await settled(1)
       assert(await page.$eval('#transport', (el) => !el.hidden), 'video transport hidden')
       assert(!errors.length, errors.join('\n'))
+    } finally {
+      await page.close()
+      await studio.close()
+    }
+  })
+
+  await check('studio: screens kept in the browser still load after the studio restarts', async () => {
+    const { startStudio } = await import('./studio.mjs')
+    const cwd = process.cwd()
+    const dir = join(ROOT, 'studio-restart')
+    mkdirSync(dir, { recursive: true })
+    const open = async (port) => {
+      process.chdir(dir)
+      return startStudio({ port, open: false, quiet: true }).finally(() => process.chdir(cwd))
+    }
+    // The same port both times: the browser's storage, where the slides live, is per origin.
+    let { server: studio, link } = await open(4790 + Math.floor(Math.random() * 100))
+    const port = Number(new URL(link).port)
+    const page = await browser.newPage()
+    try {
+      await page.setViewport({ width: 1200, height: 800 })
+      await page.goto(link, { waitUntil: 'load' })
+      await page.evaluate(() => localStorage.clear())
+      const settled = (n) =>
+        page.waitForFunction((count) => {
+          const frames = [...document.querySelectorAll('.frame')]
+          return frames.length === count && frames.every((f) => !f.classList.contains('busy')) && frames.every((f) => f.querySelector('iframe').contentWindow.stage?.ready)
+        }, { timeout: ci ? 600_000 : 60_000 }, n)
+      await page.reload({ waitUntil: 'load' })
+      await settled(5)
+      const [chooser] = await Promise.all([page.waitForFileChooser(), page.click('.add-tile')])
+      await Promise.all([page.waitForFunction(() => document.querySelectorAll('.frame').length === 1, { timeout: 30_000 }), chooser.accept([join(SAMPLES, 'tempo-03.png')])])
+      await settled(1)
+      await new Promise((r) => setTimeout(r, 400)) // the debounced save to localStorage
+      await studio.close()
+      ;({ server: studio, link } = await open(port)) // a new process in all but name: its /file allow-list starts empty
+      await page.goto(link, { waitUntil: 'load' })
+      await settled(1)
+      const errors = await page.$$eval('.frame .error', (els) => els.map((e) => e.textContent.slice(0, 160)))
+      assert(!errors.length, `the uploaded screen did not survive the restart: ${errors.join(' | ')}`)
+      const painted = await page.$eval('.frame iframe', (el) => !!el.contentWindow.stage.ctx.sources[0]?.img?.naturalWidth)
+      assert(painted, 'the restored slide has no image')
     } finally {
       await page.close()
       await studio.close()
