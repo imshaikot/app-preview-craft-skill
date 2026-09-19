@@ -4,7 +4,7 @@ description: "Creates marketing visuals for an app from its screenshots and scre
 license: MIT
 compatibility: "Needs a shell, Node 20+, npm, and a Chromium-based browser (Chrome, Chromium, Edge, Brave) with WebGL; set CHROME_PATH if it is somewhere unusual. Videos and screen-recording input need ffmpeg (set FFMPEG_PATH if not on PATH). First use runs `npm install` inside the skill (~95 MB: three.js, sharp, puppeteer-core, fonts). Works offline after that. Not usable where there is no shell or browser (claude.ai chat, the Skills API, most CI images without Chrome)."
 metadata:
-  version: "0.2.2"
+  version: "0.2.3"
 ---
 
 # app-preview-craft — store screenshots, social cards and 3D device videos
