@@ -2,6 +2,7 @@
 node_modules/
 out/
 .app-preview-craft/uploads/
+.app-preview-craft/studio/
 skills/app-preview-craft/examples/showcase/
 
 # Local Claude Code config. Leading slash on purpose: an unanchored pattern would
