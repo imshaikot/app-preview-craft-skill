@@ -1,6 +1,6 @@
 // Video layouts. Each is async (ctx) => {duration, update(t)}; update must set
 // every animated property from t alone so frames can render in any order.
-import { bookends, captions, outroFade, paintBeat, screenState, standInFront, textBox, timeline } from './common.js'
+import { bookends, captions, outroFade, paintBeat, screenState, standInFront, textBox, timeline, tuckBehind } from './common.js'
 import { clamp, ease, lerp, span, wobble } from '../lib/ease.js'
 import { keyTrack } from '../lib/keys.js'
 
@@ -348,26 +348,31 @@ export const MOTION = {
     const devs = []
     for (const id of ids) devs.push(await ctx.device({ mode: '3d', model: id }))
     for (const dev of devs) dev.edit = { path: 'device', turn: false }
-    const order = [0, 2, 1] // side, side, center (center last so it sits in front)
+    const rise = [0, 2, 1] // side, side, center: the order they come up in
+    const layers = [1, 0, 2] // front to back: each one tucks behind those before it
     return withBookends(ctx, tl, async (t, { fade }) => {
       const fan = span(t, tl.intro + 1.3, 1.1, ease.inOutCubic)
-      await Promise.all(
-        order.map(async (k, n) => {
-          const dev = devs[k]
-          const off = k - 1
-          const up = span(t, tl.intro + n * 0.22, 1.2, ease.outQuart)
-          dev.place({
-            x: (d.x + off * (d.spread ?? 0.3) * (H > W ? 1 : 0.5) * fan) * W,
-            y: lerp(H * 1.5, d.y * H + Math.abs(off) * H * 0.03 * fan, up),
-            z: off === 0 ? 0 : -0.08 * H * fan,
-            size: d.size * H * (off === 0 ? 1 : lerp(1, 0.88, fan)),
-            ry: -off * (d.fanAngle ?? 14) * 1.5 * fan + Math.sin(t * 0.6 + k) * 3,
-            rz: -off * (d.fanAngle ?? 14) * fan,
-            scale: fade,
-          })
-          await paintBeat(ctx, dev, tl, t, { offset: off })
-        }),
-      )
+      const placed = []
+      for (const k of layers) {
+        const dev = devs[k]
+        if (!dev) continue
+        const off = k - 1
+        const up = span(t, tl.intro + rise.indexOf(k) * 0.22, 1.2, ease.outQuart)
+        const p = {
+          x: (d.x + off * (d.spread ?? 0.3) * (H > W ? 1 : 0.5) * fan) * W,
+          y: lerp(H * 1.5, d.y * H + Math.abs(off) * H * 0.03 * fan, up),
+          z: off === 0 ? 0 : -0.08 * H * fan,
+          size: d.size * H * (off === 0 ? 1 : lerp(1, 0.88, fan)),
+          ry: -off * (d.fanAngle ?? 14) * 1.5 * fan + Math.sin(t * 0.6 + k) * 3,
+          rz: -off * (d.fanAngle ?? 14) * fan,
+          scale: fade,
+        }
+        // Stacked as they rise and crossing as they fan, the three would share one depth.
+        p.z = tuckBehind(ctx, dev, p, placed)
+        dev.place(p)
+        placed.push({ dev, p })
+      }
+      await Promise.all(devs.map((dev, k) => paintBeat(ctx, dev, tl, t, { offset: k - 1 })))
     })
   },
 
