@@ -4,6 +4,7 @@
 [![release](https://img.shields.io/github/v/release/imshaikot/app-preview-craft-skill)](https://github.com/imshaikot/app-preview-craft-skill/releases)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Agent Skill](https://img.shields.io/badge/Agent-Skill-8A63D2.svg)](https://agentskills.io)
+[![skills.sh](https://skills.sh/b/imshaikot/app-preview-craft-skill)](https://skills.sh/imshaikot/app-preview-craft-skill)
 
 An [Agent Skill](https://agentskills.io) that turns your app's screenshots and screen recordings
 into **App Store / Play Store screenshots, social cards, 3D device mockups and promo videos** —
@@ -25,10 +26,12 @@ rendered locally with headless Chrome, three.js and ffmpeg.
 Inside Claude Code, run `/plugin marketplace add imshaikot/app-preview-craft-skill`, then
 `/plugin install app-preview-craft@app-preview-craft` as a separate command.
 
-[`npx skills`](https://github.com/vercel-labs/skills) finds the agents on your machine and
-installs for each of them, Claude Code included: one copy in `~/.agents/skills/`, linked into
-the folders of agents that read their own. Drop `-g` to install into the current project, add
-`-a codex` to pick one agent, and update with `npx skills update`.
+The skill is listed on [skills.sh](https://skills.sh/imshaikot/app-preview-craft-skill), the
+directory behind [`npx skills`](https://github.com/vercel-labs/skills). The CLI finds the
+agents on your machine and installs for each of them, Claude Code included: one copy in
+`~/.agents/skills/`, linked into the folders of agents that read their own. Drop `-g` to
+install into the current project, add `-a codex` to pick one agent, and update with
+`npx skills update`.
 
 Without npx, clone the `skill` branch (its root is the skill) into a folder your agent reads:
 
